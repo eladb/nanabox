@@ -91,7 +91,7 @@ take over from elsewhere, open an **ephemeral cloudflared quick tunnel** (no
 account, no domain) and share the `/browser` path of the printed URL:
 
 ```bash
-cloudflared tunnel --url http://localhost:80
+cloudflared tunnel --url http://127.0.0.1:80
 # → https://<random>.trycloudflare.com   (then point them at .../browser)
 ```
 

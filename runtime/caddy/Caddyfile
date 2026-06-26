@@ -7,10 +7,15 @@
 	auto_https off
 }
 
-# Bind localhost only — nothing here is meant to face the public internet
-# directly. Per-agent published apps and the browser watch-along are reached
-# either locally or through an agent-initiated ephemeral cloudflared tunnel.
-127.0.0.1:80 {
+# Listen on the loopback interface only (never the box's public IP) but match
+# ANY Host. An ephemeral `cloudflared tunnel --url http://127.0.0.1:80` forwards
+# the tunnel's own *.trycloudflare.com hostname as the Host header; keying the
+# site to a literal address (e.g. 127.0.0.1:80) would treat that as a Host
+# matcher and fall through to an empty 200 (blank page). `:80` matches all
+# Hosts; `bind` keeps it loopback-only and covers BOTH IPv4 and IPv6 loopback
+# so `localhost` (which can resolve to ::1 first) works too.
+:80 {
+	bind 127.0.0.1 ::1
 	root * /srv/webapp/public
 
 	# Browser watch-along: /browser* → the per-box Chromium's KasmVNC web UI

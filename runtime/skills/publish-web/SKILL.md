@@ -116,7 +116,7 @@ Most frameworks bind a unix socket directly:
 Caddy binds localhost only, so by default your app is reachable on the box but not from the outside. When you need a public URL, open an **ephemeral cloudflared quick tunnel** — no Cloudflare account, no domain, no DNS:
 
 ```bash
-cloudflared tunnel --url http://localhost:80
+cloudflared tunnel --url http://127.0.0.1:80
 ```
 
 It prints a throwaway `https://<random>.trycloudflare.com` URL that forwards to Caddy, so your app is then public at:

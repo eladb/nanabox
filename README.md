@@ -39,9 +39,28 @@ curl -fsSL https://raw.githubusercontent.com/eladb/nanabox/main/nana -o ~/.local
 
 (or drop it anywhere on your `PATH`). The only local prerequisite is `ssh`.
 
-You'll need a **Hetzner Cloud API token** — create one at *Hetzner Cloud →
-Security → API Tokens* (Read & Write). `nana` finds it in `HCLOUD_TOKEN`, then an
-`hcloud` context, then prompts.
+### Getting a Hetzner Cloud token
+
+`nana` provisions on [Hetzner Cloud](https://www.hetzner.com/cloud), so you need
+an API token for a Hetzner **project**:
+
+1. Sign in at https://console.hetzner.cloud and pick (or create) a project.
+2. In the left sidebar: **Security → API Tokens → Generate API Token**.
+3. Give it a name, set permissions to **Read & Write** (write is required —
+   `nana` creates and deletes servers), and click **Generate**.
+4. **Copy the token now** — Hetzner shows it only once. It looks like a 64-char
+   string.
+
+Give the token to `nana` in any of these ways (it checks them in this order):
+
+```bash
+export HCLOUD_TOKEN=<your-token>     # 1. environment variable (simplest for automation)
+# 2. an `hcloud` CLI context, if you use the hcloud CLI
+# 3. otherwise nana prompts for it interactively
+```
+
+For an unattended/agent run, set `HCLOUD_TOKEN` in the environment. Billing is
+per-hour at the rates in the [Cost](#cost) table; `nana delete` stops the meter.
 
 ## How you reach the box
 
@@ -66,6 +85,47 @@ nana delete <name> [-y]
 human); sign in later with `nana ssh <name> agents login <name>`. Sizes map to
 provider SKUs (`small→cpx22`, `medium→cpx32`, `large→cpx42`). Names must match
 `^[a-z][a-z0-9-]{0,29}$`.
+
+## Signing in — the OAuth handshake
+
+The box reaches Claude using **your** Claude subscription. `nana new` signs the
+root agent in via a one-time OAuth code-paste that needs a human to click
+through. Here's the exact contract, so it can be driven by hand or by an agent:
+
+1. `nana new` provisions the box (a few minutes), then prints to its output:
+   ```
+   Signing in the root agent to Claude:
+     Open: https://claude.com/cai/oauth/authorize?…&state=<STATE>
+     Paste code#state:
+   ```
+   …and then **blocks reading one line from stdin**.
+2. A human opens that URL, signs into Claude, and authorizes. Claude shows a
+   string of the form `<code>#<state>`.
+3. Feed that string back to `nana` on **stdin** (the line it's waiting for). The
+   part after `#` must equal the `state=` value in the URL — that's how the two
+   halves are matched; a mismatch means the wrong URL/code pair.
+4. `nana` submits it, waits for the credentials to land on the box, restarts the
+   agent so Remote Control registers, and finishes. A Remote-Control session
+   named after the box then appears in any Claude app on that subscription.
+
+The URL and code are short-lived — complete the round-trip promptly.
+
+**Driving it programmatically (e.g. from an AI agent).** Run `nana new` with a
+pipe/PTY you control: stream its stdout until you see the `Open: https://…claude…`
+line, relay that URL to the human, collect the `code#state` they paste back, and
+write it (plus a newline) to `nana`'s stdin. Don't re-trigger the flow after you
+have a URL — each new sign-in attempt mints a fresh `state`, which would
+invalidate a code the human is already fetching.
+
+**Or split it.** Provision unattended with `nana new <name> --no-login`, then run
+the sign-in on its own later — same URL→`code#state` contract:
+
+```bash
+nana ssh <name> agents login <name>
+```
+
+`agents login` is idempotent: if the box is already signed in it just re-registers
+Remote Control and exits.
 
 ## What's on the box
 

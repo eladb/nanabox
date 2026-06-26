@@ -1,0 +1,28 @@
+#!/bin/bash
+# nanabox-runtime postrm — runs after files are removed.
+#
+# dpkg calls postrm with `remove`, `purge`, `upgrade <ver>`, etc. We only
+# clean up the on-box symlinks + state the postinst created on a real
+# `remove`/`purge` (not on an upgrade, where the new postinst re-creates
+# them anyway).
+
+set -e
+
+case "${1:-}" in
+  remove|purge)
+    # Symlinks the postinst dropped outside the package's own file list.
+    rm -f /etc/caddy/Caddyfile \
+          /etc/systemd/system/caddy.service.d/nanabox.conf \
+          /etc/systemd/system/cloudflared.service \
+          /etc/systemd/system/timers.target.wants/nanabox-auto-update.timer \
+          /etc/systemd/system/timers.target.wants/nanabox-nightly-cycle.timer \
+          /etc/systemd/system/multi-user.target.wants/nanabox-chrome.service \
+          /usr/share/nanabox/.claude/skills \
+          /usr/share/nanabox/CLAUDE.md
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0

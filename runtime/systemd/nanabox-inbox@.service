@@ -1,0 +1,17 @@
+[Unit]
+Description=Nanabox inbox drainer for %i
+After=nanabox-agent@%i.service
+Requires=nanabox-agent@%i.service
+PartOf=nanabox-agent@%i.service
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+Environment=HOME=/home/%i
+ExecStart=/usr/libexec/nanabox/inbox-drain %i
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

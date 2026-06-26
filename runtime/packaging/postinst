@@ -1,0 +1,313 @@
+#!/bin/bash
+# nanabox-runtime postinst — runs on every install AND upgrade (dpkg
+# invokes it with `configure` after unpacking the new files).
+#
+# This is the single source of truth for the on-box reconcile. Because dpkg
+# runs it on every upgrade, files that are *copied* out of the package
+# (binaries, libexec, systemd units) and in-box state that has to be
+# (re)built (/etc/shells, the shared store, caddy/cloudflared wiring, …) can
+# never silently freeze at the first-boot version.
+#
+# Package layout (FHS, dpkg convention):
+#   /usr/bin/agents, /usr/bin/agent-sh        agent CLI + login shim
+#   /usr/sbin/nanabox-update                  thin updater (dpkg -i a new .deb)
+#   /usr/libexec/nanabox/{harness,inbox-drain}
+#   /usr/lib/systemd/system/*.service|.timer  unit files (NOT /etc — admin space)
+#   /usr/lib/nanabox/                          tree-resident assets the on-box
+#                                              symlinks point into (caddy conf,
+#                                              cloudflared unit, skills, CLAUDE.md)
+#
+# Test hooks:
+#   NANABOX_STUB_CLAUDE=1     install the test stub instead of npm claude
+#   NANABOX_SKIP_CLOUDFLARED=1
+#                             don't install/enable cloudflared
+#   NANABOX_SKIP_CADDY=1      don't wire/enable caddy
+#   NANABOX_SKIP_CHROME=1     don't enable the headless Chromium container
+
+set -euo pipefail
+
+PKG_LIB=/usr/lib/nanabox
+
+have_systemd() {
+  command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
+}
+
+# --- adopt a box that previously had the tarball+symlink layout -----------
+# Old layout: /var/lib/nanabox was a *symlink* to /var/lib/nanabox-<ver>.
+# The package now owns its tree at /usr/lib/nanabox and uses /var/lib/nanabox
+# as a real directory. Replace the symlink.
+if [ -L /var/lib/nanabox ]; then
+  echo "postinst: retiring legacy /var/lib/nanabox symlink (tarball layout)"
+  rm -f /var/lib/nanabox
+fi
+install -d -m 0755 /var/lib/nanabox
+# Prune the old versioned trees the tarball updater left behind. Harmless if
+# none exist. We keep nothing — dpkg owns the tree now.
+for d in /var/lib/nanabox-*; do
+  [ -e "$d" ] || continue
+  echo "postinst: pruning legacy runtime tree $d"
+  rm -rf "$d"
+done
+# Remove the retired /usr/local/* binaries from the old layout. /usr/local/bin
+# precedes /usr/bin on the default PATH, so a stale copy there would SHADOW the
+# package's /usr/bin/agents — exactly the kind of drift we're killing.
+for old in /usr/local/bin/agents \
+           /usr/local/sbin/nanabox-update \
+           /usr/local/libexec/nanabox/harness \
+           /usr/local/libexec/nanabox/inbox-drain; do
+  if [ -e "$old" ]; then
+    echo "postinst: removing retired legacy path $old"
+    rm -f "$old"
+  fi
+done
+rmdir /usr/local/libexec/nanabox 2>/dev/null || true
+
+# --- agents group ----------------------------------------------------------
+
+if ! getent group agents >/dev/null; then
+  groupadd -r agents
+fi
+
+# --- per-agent web-app socket dir ------------------------------------------
+# /run/nanabox/agents holds one unix socket per agent (<handle>.sock); Caddy
+# reverse-proxies /<handle>/* to it. /run is tmpfs, so the canonical recreate
+# is a tmpfiles.d entry that fires on every boot. We ship that file and ALSO
+# create the dir here (install + systemd-tmpfiles --create) so it exists
+# immediately on an in-place upgrade without waiting for a reboot. 2770
+# root:agents: setgid + group-rwx so any agent user can bind its own socket.
+install -d -m 2770 -o root -g agents /run/nanabox/agents
+if have_systemd && [ -e /usr/lib/tmpfiles.d/nanabox.conf ]; then
+  systemd-tmpfiles --create /usr/lib/tmpfiles.d/nanabox.conf || true
+fi
+
+# --- shared secrets/credentials store --------------------------------------
+# Box-local store every agent can read but only root can write. Lives under
+# /etc (NOT the package tree) so it survives .deb upgrades.
+# Owned root:agents, dir 2750 (setgid + group-rx, no group-w), files 0640.
+# Holds shared.env (KEY=value, sourced by the harness) plus credential files
+# (rclone config, ssh keys, the shared gitconfig, …). Idempotent: we never
+# clobber an existing store or its contents — only create-if-absent and
+# re-assert the directory perms.
+SHARED_DIR=/etc/nanabox/shared
+install -d -m 0755 /etc/nanabox
+install -d -m 2750 -o root -g agents "$SHARED_DIR"
+# Re-assert in case a prior install created it before the agents group existed
+# or with looser bits.
+chown root:agents "$SHARED_DIR"
+chmod 2750 "$SHARED_DIR"
+# Seed an empty shared.env if absent; never truncate an existing one.
+if [ ! -e "$SHARED_DIR/shared.env" ]; then
+  install -m 0640 -o root -g agents /dev/null "$SHARED_DIR/shared.env"
+fi
+# Box-admin-managed env drop-in dir. A box admin agent writes *.env files here
+# and the harness exports every KEY in them (minus a small blocklist) into
+# every agent's process env at launch. Same posture as the parent: root:agents,
+# dir 0750 (no setgid — files are dropped by root, not group-created), files
+# expected at 0640. Idempotent: create-if-absent then re-assert perms. We never
+# seed or touch the files inside.
+if [ ! -d "$SHARED_DIR/export.d" ]; then
+  install -d -m 0750 -o root -g agents "$SHARED_DIR/export.d"
+fi
+chown root:agents "$SHARED_DIR/export.d"
+chmod 0750 "$SHARED_DIR/export.d"
+# Reconcile the shared gitconfig to the canonical credential-helper wiring.
+# Unlike shared.env (operator-owned secrets — create-if-absent, never
+# clobbered), this gitconfig is runtime-managed infra wiring. So we (re)write it
+# whenever it doesn't already point at the current helper. Idempotent: once it
+# references the helper we leave it untouched. The helper file-reads GH_TOKEN
+# from the 0640 root:agents shared.env at resolution time, so no token lives in
+# this file.
+if ! { [ -e "$SHARED_DIR/gitconfig" ] && grep -qF 'helper = /usr/libexec/nanabox/git-credential-nanabox' "$SHARED_DIR/gitconfig"; }; then
+  cat >"$SHARED_DIR/gitconfig" <<'GITCONFIG'
+# nanabox shared git config — included box-wide via /etc/gitconfig (and pointed
+# at by GIT_CONFIG_GLOBAL for the agent session). Authenticates github.com
+# pushes/fetches with a token. The git-credential-nanabox helper file-reads
+# GH_TOKEN from /etc/nanabox/shared/shared.env at resolution time, so no token
+# lives here. Rotation = update shared.env's GH_TOKEN; nothing here changes.
+# Absolute path so it resolves regardless of PATH (root/sudo contexts).
+# Runtime-managed: the postinst reconciles this file on every upgrade.
+[credential "https://github.com"]
+	helper = /usr/libexec/nanabox/git-credential-nanabox
+[credential "https://gist.github.com"]
+	helper = /usr/libexec/nanabox/git-credential-nanabox
+GITCONFIG
+  chown root:agents "$SHARED_DIR/gitconfig"
+  chmod 0640 "$SHARED_DIR/gitconfig"
+fi
+
+# Wire the shared gitconfig into /etc/gitconfig so EVERY user/context on the box
+# (root, agent handles, and the env_reset'd `sudo -u <handle> git clone` in
+# `agents new --repo`) inherits the credential helper with no per-process env
+# wiring. /etc/gitconfig is world-readable but tokenless — the helper points at
+# the 0640 shared.env, which only root + the agents group can read, so a
+# non-agents principal's credential fill resolves empty and git fails closed.
+# Idempotent: only append the include if it isn't already present.
+SHARED_GITCONFIG="$SHARED_DIR/gitconfig"
+if ! { [ -e /etc/gitconfig ] && grep -qF "path = $SHARED_GITCONFIG" /etc/gitconfig; }; then
+  {
+    printf '[include]\n'
+    printf '\tpath = %s\n' "$SHARED_GITCONFIG"
+  } >>/etc/gitconfig
+  chmod 0644 /etc/gitconfig
+fi
+
+# Box-admin gitconfig include slot: a second include line in /etc/gitconfig
+# pointing at /etc/nanabox/box/gitconfig, the box admin's git namespace (typical
+# use: box-wide `user.name` / `user.email`). Postinst-managed line, but the
+# target file is admin-managed — missing file is a no-op for git's include
+# resolution, so we don't create it here (admin's `install.sh` owns it).
+BOX_GITCONFIG=/etc/nanabox/box/gitconfig
+if ! { [ -e /etc/gitconfig ] && grep -qF "path = $BOX_GITCONFIG" /etc/gitconfig; }; then
+  {
+    printf '[include]\n'
+    printf '\tpath = %s\n' "$BOX_GITCONFIG"
+  } >>/etc/gitconfig
+  chmod 0644 /etc/gitconfig
+fi
+
+# --- box-local CLAUDE.md + skills layer ------------------------------------
+# Optional middle tier between runtime-shipped (/usr/share/nanabox) and each
+# agent's ~/.claude/. Populated by the box admin agent's install.sh; the
+# harness conditionally `--add-dir`s it when present. We just create the
+# directory so the admin has a known root:root 0755 path to write into.
+# Idempotent: never clobber existing contents, only ensure the dir + its perms.
+# Lives under /etc so it survives runtime .deb upgrades.
+install -d -m 0755 -o root -g root /etc/nanabox/box
+
+# --- per-box Chromium profile dir ------------------------------------------
+# Persistent user-data dir (/config) for the headless Chromium run by
+# nanabox-chrome.service. Lives under /var/lib/nanabox so it survives .deb
+# upgrades. Owned 1000:1000 to match the container's PUID/PGID — the
+# linuxserver image runs non-root and must be able to write /config.
+install -d -m 0755 /var/lib/nanabox/chrome
+install -d -m 0700 -o 1000 -g 1000 /var/lib/nanabox/chrome/profile
+
+# --- claude CLI (test stub only; the real CLI comes from cloud-init/npm) ---
+# On a real box claude is npm-installed by cloud-init before the package
+# lands. In the test harness we stub it so image builds don't pull the CLI.
+if [ "${NANABOX_STUB_CLAUDE:-0}" = "1" ] && [ ! -e /usr/bin/claude ]; then
+  if [ -x "$PKG_LIB/tests/stub-claude" ]; then
+    install -m 0755 "$PKG_LIB/tests/stub-claude" /usr/bin/claude
+  fi
+fi
+
+# --- /etc/shells + root shell ---------------------------------------------
+
+# Register agent-sh in /etc/shells so chsh accepts it.
+if ! grep -qxF /usr/bin/agent-sh /etc/shells 2>/dev/null; then
+  echo /usr/bin/agent-sh >>/etc/shells
+fi
+
+# Root is intentionally NOT an agent (claude refuses uid 0). Reset its shell to
+# /bin/bash — protects boxes that inherited an agent-sh shell from the retired
+# "root is an agent" design.
+if [ "$(getent passwd root | cut -d: -f7)" != "/bin/bash" ]; then
+  chsh -s /bin/bash root || true
+fi
+
+# --- shared skills + CLAUDE.md (claude --add-dir /usr/share/nanabox) ------
+
+install -d -m 0755 /usr/share/nanabox
+install -d -m 0755 /usr/share/nanabox/.claude
+ln -sfn "$PKG_LIB/skills"    /usr/share/nanabox/.claude/skills
+ln -sfn "$PKG_LIB/CLAUDE.md" /usr/share/nanabox/CLAUDE.md
+
+# --- caddy wiring ----------------------------------------------------------
+# IMPORTANT: a dpkg maintainer script must NOT call `apt-get install` — dpkg
+# holds the frontend lock while running us, so a nested apt would deadlock.
+# The custom caddy build (with the caddy-cgi plugin) is an external-apt-repo
+# dependency, installed by cloud-init (real boxes) / the test Dockerfile,
+# BEFORE the .deb. Here we only do lock-free wiring: symlink the Caddyfile +
+# drop the User=root service override. (NANABOX_SKIP_CADDY guards the rare
+# case where caddy genuinely isn't present, e.g. a stripped test env.)
+
+if [ "${NANABOX_SKIP_CADDY:-0}" != "1" ] && command -v caddy >/dev/null 2>&1; then
+  install -d -m 0755 /etc/caddy
+  ln -sfn "$PKG_LIB/caddy/Caddyfile" /etc/caddy/Caddyfile
+
+  install -d -m 0755 /etc/systemd/system/caddy.service.d
+  install -m 0644 "$PKG_LIB/caddy/caddy.service.d.conf" \
+    /etc/systemd/system/caddy.service.d/nanabox.conf
+fi
+
+# --- cloudflared wiring ----------------------------------------------------
+# Same rule: cloudflared (also an external apt repo) is installed by
+# cloud-init, not here. We only drop the unit file if the binary is present.
+if [ "${NANABOX_SKIP_CLOUDFLARED:-0}" != "1" ] && command -v cloudflared >/dev/null 2>&1; then
+  install -m 0644 "$PKG_LIB/cloudflared/cloudflared.service" \
+    /etc/systemd/system/cloudflared.service
+fi
+
+# --- systemd: enable + (re)start ------------------------------------------
+# `systemctl enable` only works with a running systemd. The package may be
+# installed at image-build time (docker tests) or first boot (cloud-init)
+# when systemd isn't running yet — so we ALSO drop the [Install] wants
+# symlinks by hand, idempotently, so the units come up on the next boot.
+
+enable_unit() {  # <unit> <target>
+  local unit="$1" target="$2"
+  install -d -m 0755 "/etc/systemd/system/${target}.wants"
+  ln -sfn "/usr/lib/systemd/system/${unit}" \
+          "/etc/systemd/system/${target}.wants/${unit}"
+}
+
+enable_unit nanabox-auto-update.timer    timers.target
+enable_unit nanabox-nightly-cycle.timer  timers.target
+# Per-box Chromium. Docker comes from cloud-init's external apt repo (not a
+# package Depends:), so only enable/start it when present; NANABOX_SKIP_CHROME
+# guards stripped test envs.
+if [ "${NANABOX_SKIP_CHROME:-0}" != "1" ] && command -v docker >/dev/null 2>&1; then
+  enable_unit nanabox-chrome.service multi-user.target
+fi
+if [ "${NANABOX_SKIP_CADDY:-0}" != "1" ]; then
+  # caddy's unit ships under /lib/systemd/system from the caddy package.
+  install -d -m 0755 /etc/systemd/system/multi-user.target.wants
+  if [ -e /lib/systemd/system/caddy.service ]; then
+    ln -sfn /lib/systemd/system/caddy.service \
+            /etc/systemd/system/multi-user.target.wants/caddy.service
+  fi
+fi
+if [ "${NANABOX_SKIP_CLOUDFLARED:-0}" != "1" ] && [ -e /etc/systemd/system/cloudflared.service ]; then
+  install -d -m 0755 /etc/systemd/system/multi-user.target.wants
+  ln -sfn /etc/systemd/system/cloudflared.service \
+          /etc/systemd/system/multi-user.target.wants/cloudflared.service
+fi
+
+if have_systemd; then
+  systemctl daemon-reload
+
+  # Auto-update timer: the box's own upgrade channel.
+  systemctl start nanabox-auto-update.timer >/dev/null 2>&1 || true
+
+  # Nightly-cycle timer: fires /nightly-cycle on every agent overnight
+  # (03:00 + a randomized per-box delay, then a per-agent on-box stagger).
+  systemctl start nanabox-nightly-cycle.timer >/dev/null 2>&1 || true
+
+  # Per-box Chromium: bring it up (idempotent — `compose up -d` is a no-op if
+  # already running, and picks up a new compose file on upgrade).
+  if [ "${NANABOX_SKIP_CHROME:-0}" != "1" ] && command -v docker >/dev/null 2>&1; then
+    systemctl restart nanabox-chrome.service || true
+  fi
+
+  if [ "${NANABOX_SKIP_CADDY:-0}" != "1" ] && command -v caddy >/dev/null 2>&1; then
+    # `restart` not `reload`: a graceful reload keeps caddy's existing uid,
+    # which on a fresh `apt install caddy` is the `caddy` user — CGIs would
+    # then EACCES on /home writes. Restart re-reads the User=root drop-in.
+    systemctl restart caddy.service || true
+  fi
+
+  if [ "${NANABOX_SKIP_CLOUDFLARED:-0}" != "1" ] && command -v cloudflared >/dev/null 2>&1; then
+    # Starts only if /etc/cloudflared/config.yml exists (ConditionPathExists).
+    systemctl reload-or-restart cloudflared.service || true
+  fi
+fi
+
+echo "nanabox-runtime: postinst reconcile complete"
+echo "  cli:           /usr/bin/agents"
+echo "  shim:          /usr/bin/agent-sh"
+echo "  libexec:       /usr/libexec/nanabox/{harness,inbox-drain}"
+echo "  tree:          $PKG_LIB"
+echo "  shared skills: /usr/share/nanabox/.claude/skills  (claude --add-dir)"
+echo "  shared store:  $SHARED_DIR  (root:agents 2750; shared.env + creds)"
+
+exit 0

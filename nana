@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""nana — provision a personal Claude-agent box on your own cloud account.
+
+Open-source edition. You bring a cloud API token; nana provisions a VM, installs
+the agent runtime, and signs the root agent into your Claude subscription. From
+then on you reach the box from any Claude app logged into that subscription
+(Remote Control) — no domain, no dashboard, nothing to host.
+
+    $ nana new mybox
+    Looking for a Hetzner token… found (HCLOUD_TOKEN)
+    Provisioning mybox (cpx32, fsn1)… ready  (203.0.113.7)
+    Installing agent runtime…
+    Signing in the root agent to Claude:
+      Open: https://claude.com/cai/oauth/authorize?…
+      Paste code: ******
+    Starting Remote Control… done.
+
+    mybox is live. Open any Claude app on this subscription to talk to it.
+
+Access model
+------------
+* Default: Remote Control, not a public URL. The box needs only OUTBOUND
+  network — no Cloudflare account, no domain, no TLS to manage. You get the full
+  multi-agent runtime: `agents new`/`send`, the headless browser, Caddy, etc.
+* Ad-hoc public URL: when an agent wants to share something it runs an ephemeral
+  `cloudflared --url` quick tunnel → a *.trycloudflare.com link. Still no account.
+
+The root agent is named after the box and is the box admin (passwordless sudo);
+create more agents from inside it with `agents new <handle>`.
+
+Provider: Hetzner Cloud (REST — the only local prereq is `ssh`). New providers
+slot in behind the Provider interface.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Optional
+
+API = "https://api.hetzner.cloud/v1"
+IMAGE = "ubuntu-24.04"
+DEFAULT_REGION = "fsn1"
+# Abstract sizes → per-provider SKUs, so `--size small` stays portable.
+SIZES = {"small": "cpx22", "medium": "cpx32", "large": "cpx42"}
+DEFAULT_SIZE = "medium"
+LABEL = {"role": "nana-box"}
+# The per-box runtime artifact (.deb), built and published by this repo's release
+# workflow. `nana new` fetches the manifest, downloads the .deb, and installs it.
+DEFAULT_MANIFEST = "https://github.com/eladb/nanabox/releases/latest/download/latest.json"
+SSH_KEY = Path.home() / ".ssh" / "nana_ed25519"
+NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,29}$")
+
+# ── output helpers ─────────────────────────────────────────────────────────
+def die(msg: str, code: int = 1):
+    print(f"nana: {msg}", file=sys.stderr); sys.exit(code)
+
+def step(msg: str):
+    # Progress → stderr, so data commands (`nana ip`) keep stdout machine-clean.
+    print(msg, file=sys.stderr, flush=True)
+
+# ── credential discovery ───────────────────────────────────────────────────
+def hetzner_token() -> str:
+    tok = os.environ.get("HCLOUD_TOKEN")
+    if tok:
+        step("Looking for a Hetzner token… found (HCLOUD_TOKEN)")
+        return tok.strip()
+    cli = Path.home() / ".config" / "hcloud" / "cli.toml"
+    if cli.exists():
+        txt = cli.read_text()
+        active = re.search(r'active_context\s*=\s*"([^"]+)"', txt)
+        if active:
+            for b in re.split(r"\n\[\[contexts\]\]", txt):
+                if re.search(rf'name\s*=\s*"{re.escape(active.group(1))}"', b):
+                    m = re.search(r'token\s*=\s*"([^"]+)"', b)
+                    if m:
+                        step(f"Looking for a Hetzner token… found (hcloud context '{active.group(1)}')")
+                        return m.group(1)
+    step("Looking for a Hetzner token… none found.")
+    print("  Create one at Hetzner Cloud → Security → API Tokens (Read & Write).")
+    try:
+        tok = input("  Paste token: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        die("aborted", 130)
+    return tok or die("no token provided")
+
+# ── provider interface ─────────────────────────────────────────────────────
+class Provider:
+    def create(self, name, size, region, user_data) -> dict: ...
+    def get(self, name) -> Optional[dict]: ...
+    def list(self) -> list: ...
+    def delete(self, name) -> bool: ...
+
+class Hetzner(Provider):
+    def __init__(self, token: str):
+        self.token = token
+
+    def _req(self, method, path, body=None) -> dict:
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(f"{API}{path}", data=data, method=method)
+        req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                raw = r.read()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")
+            try:
+                detail = json.loads(detail)["error"]["message"]
+            except Exception:
+                pass
+            die(f"Hetzner API {e.code}: {detail}")
+
+    def create(self, name, size, region, user_data):
+        return self._req("POST", "/servers", {
+            "name": name, "server_type": SIZES[size], "image": IMAGE,
+            "location": region, "user_data": user_data, "labels": LABEL,
+            "public_net": {"enable_ipv4": True, "enable_ipv6": True},
+        })["server"]
+
+    def get(self, name):
+        s = self._req("GET", f"/servers?name={name}").get("servers", [])
+        return s[0] if s else None
+
+    def list(self):
+        sel = ",".join(f"{k}={v}" for k, v in LABEL.items())
+        return self._req("GET", f"/servers?label_selector={sel}").get("servers", [])
+
+    def delete(self, name):
+        s = self.get(name)
+        if not s:
+            return False
+        self._req("DELETE", f"/servers/{s['id']}")
+        return True
+
+def ipv4(s: dict) -> Optional[str]:
+    return (s.get("public_net", {}).get("ipv4") or {}).get("ip")
+
+# ── ssh ────────────────────────────────────────────────────────────────────
+def ensure_ssh_key() -> str:
+    if not SSH_KEY.exists():
+        SSH_KEY.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f",
+                        str(SSH_KEY), "-C", "nana"], check=True,
+                       stdout=subprocess.DEVNULL)
+    return SSH_KEY.with_suffix(".pub").read_text().strip()
+
+# Ephemeral cloud boxes get recycled IPs, so a host key persisted from a deleted
+# box makes the next box at that IP fail verification. We don't persist or check
+# host keys for management SSH — the box is identified by its provider id and our
+# injected key, not by TOFU. LogLevel=ERROR hushes the /dev/null banner.
+SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10"]
+
+def ssh_argv(ip, *args, tty=False):
+    a = ["ssh", "-i", str(SSH_KEY), *SSH_OPTS]
+    if tty:
+        a.append("-tt")
+    return a + [f"root@{ip}", *args]
+
+def ssh(ip, *args, **kw):
+    return subprocess.run(ssh_argv(ip, *args), **kw)
+
+# ── cloud-init: install external prereqs + the runtime .deb ────────────────
+def user_data(name: str, pubkey: str, manifest: str) -> str:
+    # Installs the external-repo prereqs (node, gh, docker, caddy, cloudflared)
+    # the runtime package can't declare as plain Depends:, then fetches and
+    # installs the runtime .deb from the manifest. No public ingress is wired —
+    # access is Remote Control by default.
+    return f"""#cloud-config
+hostname: {name}
+disable_root: false
+# Hetzner's image ships root with an expired password; without this, PAM forces
+# a password change on login and REFUSES non-interactive SSH command execution
+# ("password change required but no TTY available") — which breaks every poll
+# and the login drive. Tell cloud-init not to expire passwords.
+chpasswd:
+  expire: false
+package_update: true
+packages: [curl, ca-certificates, jq]
+write_files:
+  - path: /root/.ssh/authorized_keys
+    permissions: '0600'
+    content: |
+      {pubkey}
+  - path: /etc/nanabox/handle
+    permissions: '0644'
+    content: |
+      {name}
+runcmd:
+  - |
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+    if ! command -v node >/dev/null 2>&1; then
+      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+      apt-get install -y -qq nodejs
+    fi
+    if ! command -v gh >/dev/null 2>&1; then
+      install -d -m 0755 /etc/apt/keyrings
+      curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
+      chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+      apt-get update -qq && apt-get install -y -qq gh
+    fi
+    command -v claude        >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code
+    command -v agent-browser >/dev/null 2>&1 || npm install -g agent-browser
+    if ! command -v docker >/dev/null 2>&1; then
+      install -d -m 0755 /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+      chmod a+r /etc/apt/keyrings/docker.asc
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | tee /etc/apt/sources.list.d/docker.list >/dev/null
+      apt-get update -qq && apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    fi
+    if ! command -v caddy >/dev/null 2>&1 || ! caddy list-modules 2>/dev/null | grep -q '^http.handlers.cgi'; then
+      apt-get install -y -qq --no-install-recommends debian-keyring debian-archive-keyring apt-transport-https || true
+      if [ ! -f /etc/apt/sources.list.d/caddy-stable.list ]; then
+        curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+        curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+        apt-get update -qq
+      fi
+      apt-get install -y -qq caddy
+      curl -fsSL -o /tmp/caddy-cgi "https://caddyserver.com/api/download?os=linux&arch=$(dpkg --print-architecture)&p=github.com%2Faksdb%2Fcaddy-cgi%2Fv2"
+      install -m 0755 /tmp/caddy-cgi /usr/bin/caddy && rm -f /tmp/caddy-cgi
+    fi
+    if ! command -v cloudflared >/dev/null 2>&1; then
+      curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+      echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
+      apt-get update -qq && apt-get install -y -qq cloudflared || true
+    fi
+  - |
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+    for i in 1 2 3 4 5; do curl -fsSL --max-time 30 -o /tmp/m.json "{manifest}" && break; sleep 5; done
+    [ -s /tmp/m.json ] || {{ echo "manifest unreachable" >&2; exit 1; }}
+    URL=$(jq -r .url /tmp/m.json); SHA=$(jq -r .sha256 /tmp/m.json)
+    curl -fsSL --max-time 600 -o /tmp/rt.deb "$URL"
+    echo "$SHA  /tmp/rt.deb" | sha256sum -c -
+    apt-get update -qq && apt-get install -y /tmp/rt.deb
+    rm -f /tmp/rt.deb /tmp/m.json
+  - touch /var/log/cloud-init-finished
+final_message: "nana box {name} booted in $UPTIME s"
+"""
+
+# ── create the box-named root agent: provision → sudo → sign in ─────────────
+# A complete OAuth authorize URL we relay must carry these — guards against a
+# truncated/garbled screen capture being handed to the user as a dead link.
+URL_RE = re.compile(r"https://\S*claude\.(?:com|ai)/\S+")
+
+def create_agent(ip, name, login=True):
+    """Stand up the box-named root agent and (optionally) sign it in.
+
+    `agents new <name>` makes a unix user + RC session named <name> (so the box
+    shows up in the Claude app as "<name>"). The root agent is the box admin, so
+    we grant it passwordless sudo. With login=True we then drive the Claude
+    sign-in; login=False defers it (used by the unattended smoke test)."""
+    r = ssh(ip, f"agents new {name}")
+    r.returncode == 0 or die(f"agents new {name} failed (rc {r.returncode})")
+    grant_sudo(ip, name)
+    if login:
+        login_agent(ip, name)
+
+def grant_sudo(ip, name):
+    """Make the root agent the box admin: passwordless sudo, plus a note in its
+    CLAUDE.md so it knows (otherwise the runtime's default guidance reads as
+    non-sudoer). The sudoers drop-in is validated and atomically installed
+    (same-dir mktemp + visudo -cf + mv), so a broken file can never go live."""
+    s = (f'H={name}; t=$(mktemp /etc/sudoers.d/.$H.XXXXXX) && '
+         f'printf "%s\\n" "# $H: box admin (root agent), passwordless sudo — installed by nana." '
+         f'"$H ALL=(ALL) NOPASSWD: ALL" > "$t" && chmod 0440 "$t" && chown root:root "$t" && '
+         f'visudo -cf "$t" >/dev/null && mv "$t" "/etc/sudoers.d/$H" && echo SUDO_OK '
+         f'|| {{ rm -f "$t"; echo SUDO_FAIL; }}')
+    r = ssh(ip, s, capture_output=True, text=True)
+    "SUDO_OK" in r.stdout or die(f"could not grant sudo to {name}: {r.stdout}{r.stderr}".strip())
+    # Tell the agent it's the admin. base64 so the multi-line note survives ssh.
+    note = ("\n## You are the box admin\n"
+            f"This agent (`{name}`) is the box's root administrator: you have "
+            "passwordless `sudo`. You can install system packages, manage systemd "
+            "units, and edit /etc. Agents you create with `agents new` do not have "
+            "sudo unless you grant it.\n")
+    b64 = base64.b64encode(note.encode()).decode()
+    ssh(ip, f"echo {b64} | base64 -d >> /home/{name}/CLAUDE.md && "
+            f"chown {name}:{name} /home/{name}/CLAUDE.md", stdout=subprocess.DEVNULL)
+
+def login_agent(ip, name):
+    """Drive the Claude sign-in via the runtime's idempotent `agents login`,
+    relaying the OAuth handshake (URL on its stdout, code#state to its stdin).
+
+    We retry to *obtain* a URL — each `agents login` re-injects /login, minting a
+    fresh state, so a flaky/slow screen capture just means another attempt. Once
+    a COMPLETE url appears we present it and feed the matching code to THAT same
+    process, so we never invalidate a URL the user is already acting on."""
+    for _ in range(3):
+        proc = subprocess.Popen(ssh_argv(ip, f"agents login {name}"),
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                text=True, bufsize=1)
+        url = None
+        for line in proc.stdout:                       # stop at the URL line
+            if "https://" in line and "claude." in line:
+                m = URL_RE.search(line)
+                cand = m.group(0).rstrip() if m else ""
+                if "state=" in cand and "code_challenge" in cand:
+                    url = cand
+                else:                                  # truncated → clean retry
+                    proc.kill()
+                break
+        if not url:
+            # stdout closed (or we killed a truncated attempt) with no URL. Let
+            # the process finish — the idempotent "already signed in, restarting"
+            # path exits 0 after a short bounce; anything else means retry.
+            try:
+                rc = proc.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                proc.kill(); continue
+            if rc == 0:
+                print(f"\n{name} is already signed in.")
+                return
+            continue                                   # no URL captured — retry
+        print("\nSigning in the root agent to Claude:")
+        print(f"  Open: {url}")
+        try:
+            code = input("  Paste code#state: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            proc.kill(); die("aborted", 130)
+        code or die("no code provided")
+        proc.stdin.write(code + "\n"); proc.stdin.flush()
+        try:
+            rc = proc.wait(timeout=180)
+        except subprocess.TimeoutExpired:
+            proc.kill(); die("login timed out waiting for credentials")
+        rc == 0 or die(f"login failed (rc {rc}); retry with "
+                       f"`nana ssh {name} agents login {name}`")
+        return
+    die("couldn't get an OAuth URL after 3 tries — the agent session may not be "
+        f"up; check `nana ssh {name} systemctl status nanabox-agent@{name}`")
+
+# ── poll helpers ───────────────────────────────────────────────────────────
+def wait_ip(prov, name, timeout=120) -> str:
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        s = prov.get(name)
+        if s and ipv4(s):
+            return ipv4(s)
+        time.sleep(3)
+    die(f"{name} never got a public IP")
+
+def wait_cloud_init(ip, timeout=900):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        r = ssh(ip, "test -f /var/log/cloud-init-finished && echo done",
+                capture_output=True, text=True)
+        if r.stdout.strip() == "done":
+            return
+        time.sleep(10)
+    die("cloud-init didn't finish — ssh in and check /var/log/cloud-init-output.log")
+
+# ── commands ───────────────────────────────────────────────────────────────
+def cmd_new(args):
+    name = args.name
+    NAME_RE.match(name) or die(f"invalid name {name!r}; must match {NAME_RE.pattern}")
+    prov = Hetzner(hetzner_token())
+    prov.get(name) and die(f"a box named {name!r} already exists")
+    pubkey = ensure_ssh_key()
+
+    step(f"Provisioning {name} ({SIZES[args.size]}, {args.region})…")
+    prov.create(name, args.size, args.region, user_data(name, pubkey, args.manifest_url))
+    ip = wait_ip(prov, name)
+    step(f"  ready  ({ip})")
+
+    step("Installing agent runtime… (a few minutes)")
+    wait_cloud_init(ip)
+
+    step(f"Creating the root agent '{name}' (box admin, sudo)…")
+    create_agent(ip, name, login=not args.no_login)
+
+    if args.no_login:
+        print(f"\n{name} provisioned (not signed in). Sign in later with:")
+        print(f"  nana ssh {name} agents login {name}")
+        return
+    print(f"\n{name} is live — a Remote Control session named '{name}' will appear")
+    print("in any Claude app on this subscription. It's the box admin (passwordless")
+    print("sudo); talk to it there and create more agents with `agents new <handle>`.")
+    print(f"  ssh: ssh -i {SSH_KEY} root@{ip}")
+
+def cmd_list(args):
+    for s in Hetzner(hetzner_token()).list():
+        print(f"{s['name']:<20} {ipv4(s) or '-':<16} {s['server_type']['name']:<8} {s['status']}")
+
+def cmd_ip(args):
+    s = Hetzner(hetzner_token()).get(args.name) or die(f"no box {args.name!r}")
+    print(ipv4(s) or die("no IPv4 yet"))
+
+def cmd_ssh(args):
+    s = Hetzner(hetzner_token()).get(args.name) or die(f"no box {args.name!r}")
+    ip = ipv4(s) or die("no IPv4 yet")
+    os.execvp("ssh", ssh_argv(ip, *args.rest))
+
+def cmd_delete(args):
+    if not args.yes and input(f"Delete box {args.name!r}? [y/N] ").strip().lower() != "y":
+        die("aborted", 130)
+    print("deleted" if Hetzner(hetzner_token()).delete(args.name) else f"no box {args.name!r}")
+
+# ── argparse ───────────────────────────────────────────────────────────────
+def main():
+    p = argparse.ArgumentParser(prog="nana", description="Provision personal Claude-agent boxes.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    n = sub.add_parser("new", help="provision a new box")
+    n.add_argument("name")
+    n.add_argument("--provider", default="hetzner", choices=["hetzner"])
+    n.add_argument("--size", default=DEFAULT_SIZE, choices=list(SIZES))
+    n.add_argument("--region", default=DEFAULT_REGION)
+    n.add_argument("--manifest-url", default=DEFAULT_MANIFEST,
+                   help="runtime manifest (latest.json)")
+    n.add_argument("--no-login", action="store_true",
+                   help="provision without driving the Claude sign-in (sign in later)")
+    n.set_defaults(fn=cmd_new)
+
+    sub.add_parser("list", help="list boxes").set_defaults(fn=cmd_list)
+    g = sub.add_parser("ip", help="print a box's IPv4"); g.add_argument("name"); g.set_defaults(fn=cmd_ip)
+    sh = sub.add_parser("ssh", help="ssh into a box"); sh.add_argument("name")
+    sh.add_argument("rest", nargs=argparse.REMAINDER); sh.set_defaults(fn=cmd_ssh)
+    d = sub.add_parser("delete", help="destroy a box"); d.add_argument("name")
+    d.add_argument("-y", "--yes", action="store_true"); d.set_defaults(fn=cmd_delete)
+
+    args = p.parse_args()
+    args.fn(args)
+
+if __name__ == "__main__":
+    main()

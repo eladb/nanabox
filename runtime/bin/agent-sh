@@ -1,0 +1,19 @@
+#!/bin/sh
+# agent-sh — login-shell shim for nanabox agents.
+#
+# Goes in /etc/passwd for every agent under the per-agent-user model.
+#
+# Behavior:
+#   agent-sh -c "<cmd>"  → exec bash -c "<cmd>"
+#                          (preserves git-over-ssh, rsync, ansible, `ssh box cmd`)
+#   agent-sh             → attach the agent's persistent dtach+claude session,
+#                          creating it on the fly if missing.
+#   agent-sh ARG...      → same as bare invocation; extra args ignored.
+#
+# Security boundary: ssh authn + `agents` group membership. The -c branch
+# is fine because anyone reaching it is already authenticated as this uid.
+
+case "$1" in
+  -c) shift; exec /bin/bash -c "$@" ;;
+  *)  exec /usr/libexec/nanabox/harness attach "$(id -un)" ;;
+esac

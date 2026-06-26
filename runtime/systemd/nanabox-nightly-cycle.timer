@@ -1,0 +1,18 @@
+[Unit]
+Description=Nightly consolidation pass for every agent on this box
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+# Spread the box-level firing across a 2-hour window (03:00–05:00 UTC) so the
+# whole fleet doesn't hit the Claude API at the same instant. systemd picks a
+# per-box delay in [0, RandomizedDelaySec] and persists it under
+# /var/lib/systemd/timers, so a given box keeps a stable nightly slot rather
+# than re-jittering every night.
+RandomizedDelaySec=7200
+# If the box was offline at the scheduled time, fire the missed run on next
+# boot.
+Persistent=true
+Unit=nanabox-nightly-cycle.service
+
+[Install]
+WantedBy=timers.target

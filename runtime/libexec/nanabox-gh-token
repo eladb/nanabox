@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""nanabox-gh-token — mint (and cache) a GitHub App installation access token
+for a box-owned GitHub App, fully on-box.
+
+If the box admin has configured a GitHub App (its app_id + private key in the
+shared store), this tool signs a short-lived App JWT with the box's private key
+(RS256, via `openssl` — no Python crypto deps), discovers the App's
+installation, exchanges the JWT for an installation access token, caches it, and
+prints just the token on stdout.
+
+Config (placed by the box admin in the shared store):
+  /etc/nanabox/shared/github-app.json      {app_id, slug, ...}   (0600/0640)
+  /etc/nanabox/shared/github-app-key.pem   the App private key   (0600)
+Cache:
+  /etc/nanabox/shared/.gh-app-token.json   {token, exp}          (0600)
+
+Exit 0 + token on stdout when it works. If no App is configured, exits non-zero
+and prints nothing — callers (git-credential-nanabox) then fall back to the
+static GH_TOKEN. Never prints the token on a command line.
+
+Usage: nanabox-gh-token            # print a valid installation token
+       nanabox-gh-token --refresh  # ignore cache, mint fresh
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
+
+SHARED = os.environ.get("NANABOX_SHARED_DIR", "/etc/nanabox/shared")
+CONF = os.path.join(SHARED, "github-app.json")
+KEY = os.path.join(SHARED, "github-app-key.pem")
+# Cache in the group-writable agents runtime dir (tmpfs, 2770 root:agents) — the
+# shared store dir itself is NOT agent-writable, and nanabox-gh-token runs as the
+# non-root agent during git ops. Falls back to no-cache if the dir is absent.
+CACHE = os.environ.get("NANABOX_GH_TOKEN_CACHE", "/run/nanabox/agents/gh-app-token.json")
+API = "https://api.github.com"
+# Refresh when fewer than this many seconds of validity remain.
+SKEW = 300
+UA = "nanabox-gh-token"
+
+
+def _b64url(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+
+def _iso_to_epoch(s: str) -> float:
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+
+def _api(method: str, path: str, jwt: str) -> dict:
+    req = urllib.request.Request(API + path, method=method)
+    req.add_header("Authorization", f"Bearer {jwt}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    req.add_header("User-Agent", UA)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read())
+
+
+def cached_token() -> str | None:
+    try:
+        with open(CACHE, "r", encoding="utf-8") as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        return None
+    tok, exp = rec.get("token"), rec.get("exp")
+    if isinstance(tok, str) and isinstance(exp, (int, float)) and exp - time.time() > SKEW:
+        return tok
+    return None
+
+
+def app_jwt(app_id: str) -> str:
+    """RS256 App JWT, signed by `openssl` from the on-box private key."""
+    now = int(time.time())
+    header = {"alg": "RS256", "typ": "JWT"}
+    # iat backdated 60s for clock skew; exp 9 min (GitHub caps App JWTs at 10).
+    payload = {"iat": now - 60, "exp": now + 540, "iss": app_id}
+    signing_input = (_b64url(json.dumps(header, separators=(",", ":")).encode())
+                     + "." +
+                     _b64url(json.dumps(payload, separators=(",", ":")).encode()))
+    p = subprocess.run(
+        ["openssl", "dgst", "-sha256", "-sign", KEY],
+        input=signing_input.encode("ascii"), capture_output=True,
+    )
+    if p.returncode != 0 or not p.stdout:
+        raise RuntimeError(f"openssl sign failed: {p.stderr.decode(errors='replace').strip()}")
+    return signing_input + "." + _b64url(p.stdout)
+
+
+def mint() -> tuple[str, float]:
+    with open(CONF, "r", encoding="utf-8") as f:
+        conf = json.load(f)
+    app_id = str(conf.get("app_id") or "").strip()
+    if not app_id or not os.path.isfile(KEY):
+        raise RuntimeError("no app_id / private key")
+    jwt = app_jwt(app_id)
+    insts = _api("GET", "/app/installations", jwt)
+    if not isinstance(insts, list) or not insts:
+        raise RuntimeError("App has no installations (install it on your repos)")
+    # A per-box App is normally installed once; an explicit account override wins.
+    want = (conf.get("account") or "").strip().lower()
+    inst = None
+    if want:
+        for i in insts:
+            if (i.get("account") or {}).get("login", "").lower() == want:
+                inst = i
+                break
+    inst = inst or insts[0]
+    res = _api("POST", f"/app/installations/{inst['id']}/access_tokens", jwt)
+    tok = res.get("token")
+    exp = _iso_to_epoch(res["expires_at"]) if res.get("expires_at") else time.time() + 3600
+    if not tok:
+        raise RuntimeError(f"no token in response: {json.dumps(res)[:200]}")
+    return tok, exp
+
+
+def write_cache(tok: str, exp: float) -> None:
+    # 0660 so root and any agents-group member (the setgid dir makes group=agents)
+    # can share + refresh the cache. Best-effort: caller ignores failures.
+    tmp = CACHE + ".tmp"
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o660), "w") as f:
+        json.dump({"token": tok, "exp": exp}, f)
+    os.replace(tmp, CACHE)
+
+
+def main() -> int:
+    refresh = "--refresh" in sys.argv[1:]
+    # No App configured → fail closed & quiet so callers fall back to GH_TOKEN.
+    if not os.path.isfile(CONF):
+        return 1
+    if not refresh:
+        tok = cached_token()
+        if tok:
+            sys.stdout.write(tok + "\n")
+            return 0
+    try:
+        tok, exp = mint()
+    except Exception as e:  # noqa: BLE001 — any failure → fall back to GH_TOKEN
+        sys.stderr.write(f"nanabox-gh-token: {type(e).__name__}: {e}\n")
+        return 1
+    try:
+        write_cache(tok, exp)
+    except OSError:
+        pass  # caching is best-effort; still return the token
+    sys.stdout.write(tok + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

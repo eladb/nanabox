@@ -1,0 +1,17 @@
+[Unit]
+Description=Per-box headed Chromium (CDP + watch-along UI) via docker compose
+Documentation=https://github.com/eladb/nanabox/issues/64
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/docker compose -f /usr/lib/nanabox/chrome/docker-compose.yml up -d
+ExecStop=/usr/bin/docker compose -f /usr/lib/nanabox/chrome/docker-compose.yml down
+# Pulling the images on first boot can take a while.
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

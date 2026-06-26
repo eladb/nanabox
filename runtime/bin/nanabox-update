@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# nanabox-update — poll the runtime manifest, install new .deb versions.
+#
+# The per-box runtime ships as a Debian package (eladb/nanabox#38). dpkg
+# owns versioning + the full install/upgrade lifecycle (the package's
+# maintainer scripts run on every install AND upgrade), so this updater is
+# thin: discover, download, verify, hand off to apt.
+#
+# Protocol:
+#   1. GET $NANABOX_MANIFEST_URL (default: the eladb/nanabox GitHub
+#      release manifest — the source of truth produced by the release workflow).
+#   2. Compare manifest.version to the installed dpkg version of
+#      nanabox-runtime. If equal, no-op.
+#   3. Otherwise: download manifest.url (the .deb), verify size + sha256,
+#      then `apt-get install -y ./pkg.deb` so the package's Depends: resolve
+#      and its postinst reconciles the box.
+#
+# Idempotent. On error (network, parse, sha256 mismatch, dpkg fail) it leaves
+# the installed package alone, cleans up staging, exits non-zero. The timer
+# retries next cycle. Network-fetch failure of the manifest is swallowed
+# (exit 0) so a transient outage doesn't spam failures.
+#
+# Env overrides (useful for tests):
+#   NANABOX_MANIFEST_URL  — default the GitHub-releases latest.json (below)
+#   NANABOX_APT_INSTALL   — install command run on the downloaded .deb;
+#                           default "apt-get install -y". The .deb path is
+#                           appended as the final arg. Tests can override
+#                           with e.g. "dpkg -i".
+#
+# Run as root.
+
+set -euo pipefail
+
+# The release workflow publishes the .deb + a latest.json manifest to the
+# eladb/nanabox repo's GitHub Releases; the /releases/latest/download/ alias
+# always resolves to the newest release. The Debian package itself is still
+# named nanabox-runtime (see PKG_NAME below).
+MANIFEST_URL="${NANABOX_MANIFEST_URL:-https://github.com/eladb/nanabox/releases/latest/download/latest.json}"
+PKG_NAME="nanabox-runtime"
+
+log() { echo "nanabox-update: $*"; }
+err() { echo "nanabox-update: $*" >&2; }
+
+# Refuse to run as non-root (apt/dpkg need it).
+if [ "$(id -u)" -ne 0 ]; then
+  err "must run as root (uid 0)"
+  exit 2
+fi
+
+manifest_tmp="$(mktemp)"
+staging_dir="$(mktemp -d)"
+cleanup() { rm -rf "$manifest_tmp" "$staging_dir"; }
+trap cleanup EXIT
+
+# Network fetch of the manifest can transiently fail — swallow quietly.
+if ! curl -fsSL --max-time 30 -o "$manifest_tmp" "$MANIFEST_URL"; then
+  log "manifest fetch failed (network?); will retry next cycle"
+  exit 0
+fi
+
+target_version=$(jq -r '.version // empty' "$manifest_tmp")
+target_url=$(jq -r '.url // empty' "$manifest_tmp")
+target_sha256=$(jq -r '.sha256 // empty' "$manifest_tmp")
+target_size=$(jq -r '.size_bytes // 0' "$manifest_tmp")
+
+if [ -z "$target_version" ] || [ -z "$target_url" ] || [ -z "$target_sha256" ]; then
+  err "manifest missing required fields (version/url/sha256)"
+  exit 1
+fi
+
+# What's installed? dpkg is the source of truth now — no on-box VERSION file.
+current_version=""
+if command -v dpkg-query >/dev/null 2>&1; then
+  current_version="$(dpkg-query -W -f='${Version}' "$PKG_NAME" 2>/dev/null || true)"
+fi
+
+# The manifest version keeps the human 'vX.Y.Z' form; the package Version
+# field drops the leading 'v' (dpkg versions must start with a digit). Compare
+# on the normalized form so 'v0.1.1' (manifest) == '0.1.1' (dpkg).
+norm() { printf '%s' "${1#v}"; }
+if [ -n "$current_version" ] && [ "$(norm "$current_version")" = "$(norm "$target_version")" ]; then
+  log "already on $target_version"
+  exit 0
+fi
+
+log "current=${current_version:-<none>} target=$target_version"
+
+deb="$staging_dir/nanabox-runtime.deb"
+log "downloading $target_url"
+if ! curl -fsSL --max-time 600 -o "$deb" "$target_url"; then
+  err "download failed"
+  exit 1
+fi
+
+actual_size=$(stat -c %s "$deb")
+if [ "$target_size" != 0 ] && [ "$actual_size" != "$target_size" ]; then
+  err "size mismatch (manifest=$target_size got=$actual_size)"
+  exit 1
+fi
+
+actual_sha256=$(sha256sum "$deb" | awk '{print $1}')
+if [ "$actual_sha256" != "$target_sha256" ]; then
+  err "sha256 mismatch (manifest=$target_sha256 got=$actual_sha256)"
+  exit 1
+fi
+log "sha256 verified"
+
+# Hand off to dpkg/apt. Default is apt-get install so the package's Depends:
+# resolve; the .deb path is appended as the final argument. dpkg replaces a
+# running binary's file (incl. this very script) correctly — the maintainer
+# scripts run to completion from the on-disk copy.
+export DEBIAN_FRONTEND=noninteractive
+read -r -a install_cmd <<<"${NANABOX_APT_INSTALL:-apt-get install -y}"
+log "installing via: ${install_cmd[*]} $deb"
+if ! "${install_cmd[@]}" "$deb"; then
+  err "package install failed"
+  exit 1
+fi
+
+log "installed $target_version"

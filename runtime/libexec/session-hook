@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Claude Code SessionStart hook — track the agent's LIVE session id.
+
+The harness pins `--session-id <deterministic>` / `--resume` only at launch, but
+`/clear` (and compaction) fork a NEW random session id mid-process and write a
+new transcript .jsonl. An external reader that resolves the agent's transcript by
+the deterministic per-handle id would, after a `/clear`, stay glued to the OLD
+session while new turns land elsewhere.
+
+This hook fires on every SessionStart (startup/resume/clear/compact) and records
+the current session id to a per-handle pointer such a reader can prefer:
+
+    ~/.nana/session-<HANDLE>.json = { session_id, source, ts }
+
+Per-HANDLE, not just per-$HOME: same-uid `agents spawn` peers share one $HOME
+(and one ~/.nana), so a home-only path would collide between peers (#177/#183).
+The harness exports AGENT_NAME=<handle>.
+
+Observational: reads stdin, writes the pointer, exits 0. Never blocks the
+session.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+
+
+def main() -> None:
+    # Require AGENT_NAME — never guess the handle (eladb/nanabox#195). The
+    # pointer filename is keyed by handle, but $HOME is shared by same-uid spawn
+    # peers, so a getpwuid(uid) fallback returns an ARBITRARY peer's name for the
+    # shared uid and would write the pointer under the wrong handle. A real agent
+    # session is always launched by the harness with AGENT_NAME exported; a
+    # claude started any other way (manual/diagnostic, no AGENT_NAME) is not a
+    # managed session and must not record a pointer — it can't know which handle
+    # it is. Skipping just leaves an external reader on the correct
+    # deterministic-id fallback.
+    h = os.environ.get("AGENT_NAME", "").strip()
+    if not h:
+        return
+    try:
+        data = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    sid = data.get("session_id")
+    if not sid:
+        return
+    path = os.path.join(os.path.expanduser("~"), ".nana", f"session-{h}.json")
+    rec = {
+        "session_id": sid,
+        "source": data.get("source"),
+        "ts": int(time.time()),
+    }
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rec, f)
+        os.replace(tmp, path)  # atomic
+    except OSError:
+        pass  # best-effort; a failed pointer just falls back to the deterministic id
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

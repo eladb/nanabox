@@ -1,0 +1,61 @@
+# Per-box headed Chromium for agents (CDP) + a human watch-along UI.
+#
+# Managed by nanabox-chrome.service (`docker compose up -d` on boot). One
+# shared Chromium per box — the box is a single customer; all agents attach to
+# the same instance and share the profile/cookies. See the `browser` skill.
+#
+# Reachability:
+#   - CDP   on 127.0.0.1:9222 (agents, via `agent-browser --cdp 9222`)
+#   - watch-along UI on 127.0.0.1:3000, reverse-proxied by Caddy at the
+#     /browser route (localhost only).
+#
+# Neither port is published to 0.0.0.0. To let a human watch along over the
+# internet, an agent opens an ephemeral
+#   cloudflared tunnel --url http://localhost:80
+# quick tunnel and shares the /browser path of the resulting *.trycloudflare.com
+# URL.
+services:
+  chrome:
+    # Pinned (not :latest): the image switched KASM->selkies and changed its
+    # launch behavior, breaking CDP on fresh pulls. This is a version validated
+    # working.
+    image: lscr.io/linuxserver/chromium:09ce6dc3-ls33
+    container_name: nanabox-chrome
+    restart: unless-stopped
+    shm_size: 1gb
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      # Non-root: the linuxserver s6/desktop init never launches Chromium under
+      # PUID=0, so CDP stays dead (#71). 1000 matches the reference; the host
+      # profile dir is chowned to 1000:1000 by the package postinst.
+      PUID: 1000
+      PGID: 1000
+      TZ: UTC
+      # KasmVNC/Selkies served under a subpath so Caddy can mount it at
+      # /browser without rewriting the app's asset/websocket URLs. Both
+      # slashes are required by the image.
+      SUBFOLDER: /browser/
+      CHROME_CLI: >-
+        --remote-debugging-port=9222
+        --remote-debugging-address=0.0.0.0
+        --remote-allow-origins=*
+        --no-first-run
+        --disable-features=Translate
+    volumes:
+      - /var/lib/nanabox/chrome/profile:/config
+    ports:
+      - "127.0.0.1:3000:3000"   # KasmVNC web UI (HTTP) — reached via Caddy /browser
+      # CDP (9222) is published via the cdp-proxy sidecar below, not directly:
+      # modern Chromium ignores --remote-debugging-address and binds to
+      # 127.0.0.1 inside the container regardless. socat bridges 9223 -> 9222.
+      - "127.0.0.1:9222:9223"
+
+  cdp-proxy:
+    image: alpine/socat:latest
+    container_name: nanabox-chrome-cdp-proxy
+    restart: unless-stopped
+    depends_on:
+      - chrome
+    network_mode: "service:chrome"
+    command: ["TCP-LISTEN:9223,fork,reuseaddr", "TCP:127.0.0.1:9222"]

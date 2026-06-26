@@ -1,0 +1,29 @@
+[Unit]
+Description=Nanabox agent harness for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=%i
+Group=%i
+# systemd resolves HOME from /etc/passwd when User= is set, but
+# WorkingDirectory defaults to / regardless — `~` tells systemd to
+# resolve it the same way as HOME (the user's pw_dir). Without this
+# claude runs in / and CLAUDE.md auto-discovery, project skills, etc.
+# all silently miss the agent's home.
+WorkingDirectory=~
+ExecStart=/usr/libexec/nanabox/harness start %i
+# dtach hardcodes mode 0600 on the socket regardless of umask, so we
+# widen it after start. setgid on .dtach already gave it the right
+# group (agents). harness fix-socket resolves the home via getent so
+# this works for root (/root) and /home/<handle> alike.
+ExecStartPost=/usr/libexec/nanabox/harness fix-socket %i
+Restart=on-failure
+RestartSec=5s
+# KillMode=process so stopping the unit doesn't take down the dtach'd claude.
+KillMode=process
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

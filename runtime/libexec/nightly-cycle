@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# Fires the /nightly-cycle slash command on every agent on this box, then
+# restarts each one once its day summary has been written so the fresh
+# claude process re-reads CLAUDE.md + /usr/share/nanabox/.claude/skills/
+# (which `/clear` alone doesn't reload). #145.
+#
+# Invoked by nanabox-nightly-cycle.service (triggered by the .timer around
+# 03:00–05:00 UTC — see RandomizedDelaySec in the .timer for the fleet-level
+# spread, and the per-agent stagger below for the on-box spread). Runs as
+# root; `agents send` + `systemctl restart` both work.
+#
+# Per-agent flow:
+#
+#   1. agents send <h> "/nightly-cycle"
+#   2. poll for ~<h>/.nightly-cycle-summary.md mtime newer than the
+#      run-start epoch; up to POLL_SECS (default 1800 = 30 min).
+#   3. systemctl restart nanabox-agent@<h>  → kills the dtach'd claude
+#      and brings it back fresh.
+#   4. wait for the socket to come back (up to SOCKET_WAIT_SECS).
+#   5. agents send <h> "Read /home/<h>/.nightly-cycle-summary.md … "
+#      so the fresh context renders the briefing the way today's
+#      `agents clear --message-file` flow did.
+#
+# Agents that don't write the summary within the timeout still get
+# restarted — better to flush stale state than to leave them in limbo.
+
+set -euo pipefail
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+# How long to wait per-agent for the summary file to appear / be updated.
+POLL_SECS="${NIGHTLY_CYCLE_POLL_SECS:-1800}"
+# How long to wait per-agent for the dtach socket to come back after
+# `systemctl restart`.
+SOCKET_WAIT_SECS="${NIGHTLY_CYCLE_SOCKET_WAIT_SECS:-60}"
+
+# Per-agent stagger window. The .timer already spreads the *box-level* firing
+# across the fleet (RandomizedDelaySec), but a single box can host several
+# agents — and without this they'd all `/nightly-cycle` (i.e. hit the Claude
+# API) in the same instant. We delay each agent's fire by a stable offset
+# derived from a hash of its handle, spread across [0, STAGGER_SECS). The
+# offset is deterministic per handle (idempotent across runs / reruns) so a
+# given agent always lands in the same slot. Default 1800s = 30 min.
+STAGGER_SECS="${NIGHTLY_CYCLE_STAGGER_SECS:-1800}"
+
+# Deterministic per-handle offset in [0, STAGGER_SECS). Hash the handle with
+# md5 and reduce mod the window. Stable across runs; no $RANDOM (which would
+# re-jitter every night and isn't reproducible for debugging).
+stagger_offset() {
+  local h="$1" hex dec
+  [ "$STAGGER_SECS" -gt 0 ] 2>/dev/null || { echo 0; return 0; }
+  hex=$(printf '%s' "$h" | md5sum | cut -c1-8)
+  dec=$((16#$hex))
+  echo $(( dec % STAGGER_SECS ))
+}
+
+START_EPOCH=$(date -u +%s)
+
+# `agents list` prints a header (AGENT STATUS HOME) then one row per
+# agent. Skip the header + blanks.
+mapfile -t handles < <(agents list | awk 'NR > 1 && NF { print $1 }')
+
+if [ ${#handles[@]} -eq 0 ]; then
+  echo "nightly-cycle: no agents found, nothing to do"
+  exit 0
+fi
+
+# ---- 1. fire /nightly-cycle ------------------------------------------------
+
+for h in "${handles[@]}"; do
+  [ -n "$h" ] || continue
+  # Sleep until this agent's deterministic slot, measured from the run start
+  # (absolute target, not cumulative — so the loop body's own runtime doesn't
+  # compound the offset). Skip if we're already past the slot.
+  off=$(stagger_offset "$h")
+  target=$((START_EPOCH + off))
+  now=$(date -u +%s)
+  wait=$((target - now))
+  if [ "$wait" -gt 0 ]; then
+    echo "nightly-cycle: -> $h: staggering ${wait}s (slot +${off}s)"
+    sleep "$wait"
+  fi
+  echo "nightly-cycle: -> $h: send /nightly-cycle"
+  agents send "$h" "/nightly-cycle" || echo "nightly-cycle: send to $h failed" >&2
+done
+
+# ---- 2 → 5. per-agent: wait for summary, restart, re-prompt ----------------
+
+summary_path() {
+  # Per-handle path (eladb/nanabox#183). Same-uid `agents spawn` peers share
+  # $home, and the skill used to write the summary to the agent's *cwd*
+  # ($PWD/.nightly-cycle-summary.md) while this resolver read $home/… — so for a
+  # peer whose cwd is a subdir of the shared home, the write and read paths
+  # diverged and the box re-prompted the peer to read the HOME-owner's summary
+  # (cross-agent identity bleed). A deterministic ~/.agents/<handle>/ path is
+  # unambiguous per handle and matches what the skill now writes.
+  local h="$1" home
+  home=$(getent passwd "$h" | cut -d: -f6)
+  [ -n "$home" ] || { echo ""; return 0; }
+  echo "$home/.agents/$h/nightly-summary.md"
+}
+
+wait_for_summary() {
+  local h="$1" path mtime
+  path=$(summary_path "$h")
+  [ -n "$path" ] || return 1
+  local deadline=$((SECONDS + POLL_SECS))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ -f "$path" ]; then
+      mtime=$(stat -c %Y "$path" 2>/dev/null || echo 0)
+      if [ "$mtime" -ge "$START_EPOCH" ]; then
+        # Give the agent a moment to finish its `agents clear` injection
+        # so the /clear+render don't fight the restart half-way through.
+        sleep 5
+        return 0
+      fi
+    fi
+    sleep 10
+  done
+  return 1
+}
+
+socket_path() {
+  local h="$1" home
+  home=$(getent passwd "$h" | cut -d: -f6)
+  [ -n "$home" ] || { echo ""; return 0; }
+  echo "$home/.dtach/$h.sock"
+}
+
+wait_for_socket() {
+  local sock="$1"
+  local deadline=$((SECONDS + SOCKET_WAIT_SECS))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ -S "$sock" ] && </dev/null timeout 1 dtach -p "$sock" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+for h in "${handles[@]}"; do
+  [ -n "$h" ] || continue
+  if wait_for_summary "$h"; then
+    echo "nightly-cycle: -> $h: summary observed; restarting"
+  else
+    echo "nightly-cycle: -> $h: TIMEOUT waiting for summary; restarting anyway" >&2
+  fi
+
+  # `agents restart` (cmd_restart) handles the kill_session + systemctl
+  # restart dance, including the KillMode=process workaround. Use it
+  # rather than calling systemctl directly so we benefit from any future
+  # fixes.
+  if ! agents restart "$h" 2>&1; then
+    echo "nightly-cycle: -> $h: restart failed; continuing" >&2
+    continue
+  fi
+
+  sock=$(socket_path "$h")
+  if [ -z "$sock" ] || ! wait_for_socket "$sock"; then
+    echo "nightly-cycle: -> $h: socket did not come back; skipping re-prompt" >&2
+    continue
+  fi
+
+  # Re-prompt: ask the fresh session to render the summary it just wrote.
+  # This mirrors what `agents clear --message-file` did before the
+  # restart, but lands as fresh user input on the brand-new claude
+  # process — which means it also picks up the up-to-date CLAUDE.md +
+  # skills loaded from disk.
+  briefing="Read $(summary_path "$h") — it's a briefing prepared for you by your previous session. Present its contents back to me, nicely formatted as markdown, then end your turn and wait for instructions."
+  if ! agents send "$h" "$briefing" 2>&1; then
+    echo "nightly-cycle: -> $h: re-prompt send failed" >&2
+  fi
+done
+
+echo "nightly-cycle: done"

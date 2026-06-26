@@ -1,0 +1,6 @@
+*.deb
+latest.json
+nana_ed25519*
+.env
+*.bundle
+__pycache__/

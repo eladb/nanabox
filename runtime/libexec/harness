@@ -1,0 +1,364 @@
+#!/bin/sh
+# harness — single source of truth for launching/attaching an agent's
+# persistent claude session.
+#
+# Usage:
+#   harness start  <handle>   # create dtach+claude session, detach. Used by systemd.
+#   harness attach <handle>   # attach (or create) the session. Used by agent-sh.
+#   harness flags  <handle>   # print the canonical claude argv (for debugging).
+#
+# The dtach socket lives at ~<handle>/.dtach/<handle>.sock and is owned
+# <handle>:agents mode 0660 — peer agents in the `agents` group can deliver
+# messages via dtach -p (same mechanism today's `agents send` uses).
+
+set -eu
+
+if [ $# -lt 1 ]; then
+  echo "usage: harness <start|attach|flags> <handle>" >&2
+  exit 2
+fi
+VERB="$1"
+HANDLE="${2:-$(id -un)}"
+
+HOME_DIR="$(getent passwd "$HANDLE" | cut -d: -f6)"
+[ -n "$HOME_DIR" ] || { echo "harness: no home for $HANDLE" >&2; exit 1; }
+
+SOCK_DIR="$HOME_DIR/.dtach"
+SOCK="$SOCK_DIR/$HANDLE.sock"
+
+# Strip Bedrock env so claude uses standard Anthropic API. Also unset any
+# ambient/systemd-inherited CLAUDE_CODE_OAUTH_TOKEN: it has precedence over the
+# per-agent ~/.claude/.credentials.json and would silently re-disable Remote
+# Control, which now belongs to each agent's own interactive /login (#61).
+unset CLAUDE_CODE_USE_BEDROCK AWS_BEARER_TOKEN_BEDROCK \
+      ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL \
+      ANTHROPIC_DEFAULT_HAIKU_MODEL CLAUDE_CODE_OAUTH_TOKEN
+
+# Color + identity for the inner harness.
+export AGENT_NAME="$HANDLE"
+export TERM="${TERM:-xterm-256color}"
+export COLORTERM="${COLORTERM:-truecolor}"
+# Disable Claude's self-updater. claude is a root-owned global npm install
+# (/usr/lib/node_modules); agents are non-sudoers and can't write the prefix, so
+# every auto-update attempt fails and spams "Auto-update failed: no write
+# permission to npm prefix · Run /doctor" into the session. The claude version
+# is operator/runtime-managed (agents must never self-update), so turn the
+# updater off outright — verified to suppress the message (eladb/nanabox#193).
+export DISABLE_AUTOUPDATER=1
+
+# Deterministic per-handle Claude session id. `agents spawn` peers share a unix
+# home (hence one ~/.claude/projects/<slug>/ dir), so without a stable id a
+# per-agent session lookup collides — it can only pick newest-mtime and returns
+# whichever peer wrote last (eladb/nanabox#177). Keying the id on
+# the handle gives each peer its own session file, and lets us --resume it
+# across boots (the #17 cross-boot-persistence item). Best-effort: if python3
+# is missing SESSION_ID stays empty and we fall back to the prior behavior
+# (claude picks a random id; single-agent boxes are unaffected either way).
+SESSION_ID="$(python3 -c 'import uuid,sys; print(uuid.uuid5(uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8"), "nanabox-agent:"+sys.argv[1]))' "$HANDLE" 2>/dev/null || true)"
+# Does this session already exist? It decides --resume (exists) vs --session-id
+# (create) below. Claude stores sessions under ~/.claude/projects/<slug>/ where
+# <slug> derives from the *cwd*, NOT the home — so a subdir-cwd `agents spawn`
+# peer (e.g. cwd /home/x/ios) writes under -home-x-ios, not the home slug
+# -home-x. The old check looked only at the home slug, missed the existing
+# session for such peers, picked --session-id, and claude exited 1 ("Session ID
+# already in use") → crash loop (eladb/nanabox#177/#180 slug family). Glob the
+# id across ALL slug dirs so the resume/create decision is correct regardless
+# of cwd.
+SESSION_EXISTS=0
+if [ -n "$SESSION_ID" ]; then
+  for _sf in "$HOME_DIR"/.claude/projects/*/"$SESSION_ID".jsonl; do
+    [ -f "$_sf" ] && { SESSION_EXISTS=1; break; }
+  done
+fi
+export HOME="$HOME_DIR"
+
+# Per-agent ~/.local/bin (pip --user, hand-dropped CLIs) on PATH so anything
+# the agent installs into their own home is found without an extra wrapper.
+# Idempotent: skip when already present so repeated harness invocations don't
+# keep prepending. PATH is in SHARED_EXPORT_BLOCKLIST below, so neither the
+# shared store nor the per-agent ~/.env can clobber this.
+case ":${PATH:-}:" in
+  *":$HOME_DIR/.local/bin:"*) ;;
+  *) PATH="$HOME_DIR/.local/bin${PATH:+:$PATH}"; export PATH ;;
+esac
+
+# --- shared tier-2 auth (eladb/nanabox#39) --------------------------------
+# The harness is the single place that wires tooling/infra auth that must be
+# present *before* the agent acts (Claude's own auth, GitHub/git). It runs for
+# both `start` (systemd) and `attach` (the agent-sh shim), so the two paths
+# can never disagree. Everything else stays file-read (own ~/.env first, then
+# /etc/nanabox/shared/ — documented in the system CLAUDE.md).
+#
+# We source a curated allowlist from the box-local shared store and export it.
+# A per-agent ~/.env value WINS on collision (it's sourced last), matching the
+# documented "own .env overrides shared" lookup order.
+SHARED_DIR=/etc/nanabox/shared
+SHARED_ENV="$SHARED_DIR/shared.env"
+# Box-admin-managed env drop-in dir (eladb/nanabox#83). Files here are sourced
+# in lex order between the operator allowlist and the per-agent ~/.env, with
+# every KEY in them exported (no allowlist) — but a small blocklist of keys
+# the runtime/shell manages is silently skipped so an admin file can't break
+# the agent's process basics.
+SHARED_EXPORT_D="$SHARED_DIR/export.d"
+# The allowlist of infra-auth keys the harness is allowed to promote into the
+# process environment. Anything in shared.env that isn't here stays file-read.
+# CLAUDE_CODE_OAUTH_TOKEN is deliberately NOT here: per-agent interactive /login
+# owns Claude auth now (#61). The env token has precedence over the per-agent
+# ~/.claude/.credentials.json and a setup-token can't establish Remote Control.
+SHARED_ALLOWLIST="GH_TOKEN GITHUB_TOKEN GIT_CONFIG_GLOBAL RCLONE_CONFIG"
+# Keys the runtime/shell owns; an admin file in export.d/ must NOT clobber
+# them. A blocked assignment in export.d/ is silently skipped (the rest of the
+# file still applies). AGENT_NAME is set by the harness itself just above;
+# PATH/HOME/USER/LOGNAME/SHELL/etc. are process-basics no admin should reset.
+SHARED_EXPORT_BLOCKLIST="PATH HOME USER LOGNAME SHELL IFS PWD OLDPWD UID EUID AGENT_NAME TERM COLORTERM"
+
+# _env_unquote VALUE — echo VALUE with surrounding whitespace stripped and a
+# fully matched pair of double or single quotes removed. Shared parsing helper
+# for both the allowlist loader and the export.d loader.
+_env_unquote() {
+  _v=$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  case "$_v" in
+    \"*\") _v=${_v#\"}; _v=${_v%\"} ;;
+    \'*\') _v=${_v#\'}; _v=${_v%\'} ;;
+  esac
+  printf '%s' "$_v"
+}
+
+# load_env_allowlisted FILE — for each KEY in $SHARED_ALLOWLIST, if FILE
+# defines KEY (last assignment wins), export it. POSIX sh, no `source` of
+# untrusted content: we grep the specific keys so a stray line in the file
+# can't run code. Values may be bare or "double"/'single' quoted.
+load_env_allowlisted() {
+  _file="$1"
+  [ -r "$_file" ] || return 0
+  for _k in $SHARED_ALLOWLIST; do
+    # Last matching assignment in the file wins.
+    _line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$_k=" "$_file" 2>/dev/null | tail -n 1)
+    [ -n "$_line" ] || continue
+    # Strip a leading `export `, then everything up to and including the `=`.
+    _val=$(_env_unquote "${_line#*=}")
+    [ -n "$_val" ] || continue
+    export "$_k=$_val"
+  done
+}
+
+# load_env_export_d DIR — source every *.env file under DIR (lex order) and
+# export EVERY KEY=VALUE defined in them, except keys in $SHARED_EXPORT_BLOCKLIST.
+# Same parsing shape as load_env_allowlisted (KEY=, optional `export `,
+# bare/"double"/'single'-quoted values, comments, last-assignment-wins within
+# a single file) — we just iterate the file's keys instead of a fixed list, so
+# we can't reuse load_env_allowlisted directly without changing its contract.
+load_env_export_d() {
+  _dir="$1"
+  [ -d "$_dir" ] || return 0
+  for _file in "$_dir"/*.env; do
+    [ -r "$_file" ] || continue
+    # Discover the set of keys assigned in this file (skipping blanks and #
+    # comments), then for each key replay the same last-wins lookup the
+    # allowlist path uses so duplicates within a file resolve identically.
+    _keys=$(grep -E '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' "$_file" 2>/dev/null \
+              | sed -E 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/' \
+              | awk '!seen[$0]++')
+    for _k in $_keys; do
+      # Blocked keys (runtime/shell basics) are silently skipped.
+      case " $SHARED_EXPORT_BLOCKLIST " in *" $_k "*) continue ;; esac
+      _line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$_k=" "$_file" 2>/dev/null | tail -n 1)
+      [ -n "$_line" ] || continue
+      _val=$(_env_unquote "${_line#*=}")
+      # Mirror the allowlist path: an empty value is a no-op (admin "unset"
+      # is expressed by deleting the line, not by KEY=).
+      [ -n "$_val" ] || continue
+      export "$_k=$_val"
+    done
+  done
+}
+
+# Shared allowlist first, then box-admin export.d/ drop-ins, then the agent's
+# private ~/.env so per-agent values override both on key collision.
+load_env_allowlisted "$SHARED_ENV"
+load_env_export_d    "$SHARED_EXPORT_D"
+load_env_allowlisted "$HOME_DIR/.env"
+
+# Default GIT_CONFIG_GLOBAL to the shared gitconfig (which wires git auth to
+# GH_TOKEN) unless the store explicitly set it. Only if the file exists, so a
+# box without the shared store keeps git's normal ~/.gitconfig behavior.
+if [ -z "${GIT_CONFIG_GLOBAL:-}" ] && [ -r "$SHARED_DIR/gitconfig" ]; then
+  export GIT_CONFIG_GLOBAL="$SHARED_DIR/gitconfig"
+fi
+
+# Optional harness override via ~/.nana/config.json (matches the legacy schema).
+CMD=claude
+ARGS=""
+CONFIG="$HOME_DIR/.nana/config.json"
+if [ -r "$CONFIG" ] && command -v jq >/dev/null 2>&1; then
+  parsed_cmd=$(jq -r '.harness.cmd // "claude"' "$CONFIG" 2>/dev/null || echo claude)
+  [ -n "$parsed_cmd" ] && [ "$parsed_cmd" != "null" ] && CMD="$parsed_cmd"
+  if [ "$CMD" != "claude" ]; then
+    ARGS="$(jq -r '.harness.args[]?' "$CONFIG" 2>/dev/null | tr '\n' ' ' || true)"
+  fi
+fi
+
+# Canonical claude flags. Centralised here so the systemd unit and the
+# login shim never disagree.
+#
+# Session continuity (#17 / #177): we pin a deterministic per-handle session
+# id (SESSION_ID, computed above). `--session-id <uuid>` requires the id to be
+# unused, while `--resume <uuid>` requires it to already exist — so we pick
+# based on whether the session file is already on disk: --session-id to create
+# it the first time, --resume to continue it on every later (re)start and
+# across boots. This both persists sessions and keeps same-uid `agents spawn`
+# peers from colliding in the shared projects dir.
+# ensure_hooks — install the box's Claude Code hooks into the agent's OWN
+# ~/.claude/settings.json (eladb/nanabox#181). Claude only honors hooks from a
+# trusted settings source (user/project/managed) — NOT a transient --settings
+# payload — so the box-shipped /usr/lib/nanabox/hooks.settings.json is merged
+# into the agent's user settings here, at every start, as the agent (this
+# harness runs as the handle's unix user). The merge is idempotent: it appends
+# our AskUserQuestion PreToolUse/PostToolUse entries and `unique`-dedupes, so
+# re-runs don't pile up and any hooks the agent set themselves are preserved.
+# Best-effort: a failure here must never block the agent's launch.
+ensure_hooks() {
+  [ "$CMD" = "claude" ] || return 0
+  local src=/usr/lib/nanabox/hooks.settings.json
+  [ -f "$src" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local d="$HOME_DIR/.claude" f="$HOME_DIR/.claude/settings.json"
+  mkdir -p "$d" 2>/dev/null || return 0
+  local existing='{}'
+  [ -f "$f" ] && existing=$(cat "$f" 2>/dev/null) && [ -n "$existing" ] || existing='{}'
+  # Merge EVERY hook event present in $src (PreToolUse/PostToolUse for the
+  # AskUserQuestion bridge #181, SessionStart for live-session tracking #184),
+  # generically + idempotently (`unique` dedupes), preserving any hooks the
+  # agent set themselves.
+  printf '%s' "$existing" | jq --slurpfile h "$src" '
+    reduce (($h[0].hooks // {}) | keys[]) as $ev (.;
+      .hooks[$ev] = (((.hooks[$ev] // []) + ($h[0].hooks[$ev] // [])) | unique))
+  ' >"$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" || rm -f "$f.tmp"
+}
+
+build_argv() {
+  if [ "$CMD" = "claude" ]; then
+    # --add-dir /usr/share/nanabox brings the system CLAUDE.md AND the system
+    # skills tree (at /usr/share/nanabox/.claude/skills/) into the agent's
+    # session. This replaces the per-home symlinks `agents new` used to
+    # inject, keeping each agent's ~/.claude/ 100% theirs.
+    #
+    # /etc/nanabox/box (eladb/nanabox#82) is the optional box-local layer the
+    # box admin agent populates via its install.sh — box-specific CLAUDE.md +
+    # skills shown to every agent on this box. Added only when present so a
+    # box without an admin sees no change. Order matters: claude's later
+    # --add-dir entries take precedence on skill-name collisions, giving the
+    # documented runtime → box → agent-home layering (agent-home wins).
+    set -- "$CMD" --dangerously-skip-permissions \
+                  --add-dir /usr/share/nanabox
+    if [ -d /etc/nanabox/box ]; then
+      set -- "$@" --add-dir /etc/nanabox/box
+    fi
+    # Identity grounding (eladb/nanabox#183). Same-uid `agents spawn` peers share
+    # $HOME and every first-person-voiced thing in it (CLAUDE.md, the memory
+    # store, settings, the git tree); with no signal of which agent it is, a peer
+    # reads the shared "you" as itself and mis-grounds. Inject a per-handle
+    # identity block (from `agents ctx`) into the system prompt.
+    #
+    # Pass it via --append-system-prompt-FILE, never the inline value: build_argv
+    # is consumed by an UNQUOTED $(build_argv) that word-splits on IFS, so a
+    # multi-word inline value shatters into ~95 stray args — which crashed
+    # an agent's launch (claude exited 1) and silently broke the block for
+    # everyone (claude saw only "You"). A file PATH has no whitespace and
+    # survives the split. Per-handle filename ($HOME is shared by peers).
+    # Best-effort: any failure just omits the block (never blocks launch).
+    if command -v agents >/dev/null 2>&1; then
+      _idf="$HOME_DIR/.nana/identity-$HANDLE.txt"
+      mkdir -p "$HOME_DIR/.nana" 2>/dev/null || true
+      if agents ctx >"$_idf.tmp" 2>/dev/null && [ -s "$_idf.tmp" ]; then
+        if mv "$_idf.tmp" "$_idf" 2>/dev/null; then
+          set -- "$@" --append-system-prompt-file "$_idf"
+        fi
+      else
+        rm -f "$_idf.tmp" 2>/dev/null || true
+      fi
+    fi
+    set -- "$@" --remote-control "$HANDLE"
+    if [ -n "$SESSION_ID" ]; then
+      if [ "$SESSION_EXISTS" = 1 ]; then
+        set -- "$@" --resume "$SESSION_ID"
+      else
+        set -- "$@" --session-id "$SESSION_ID"
+      fi
+    fi
+    printf '%s\n' "$@"
+    return
+  fi
+  printf '%s\n' "$CMD"
+  # shellcheck disable=SC2086
+  set -- $ARGS
+  for a in "$@"; do printf '%s\n' "$a"; done
+}
+
+mkdir -p "$SOCK_DIR"
+# 2770: setgid + group-rwx. setgid is what makes new sockets inherit
+# the dir's group (agents) regardless of the harness uid's primary group.
+chmod 2770 "$SOCK_DIR" 2>/dev/null || true
+# umask 0007 so the dtach socket lands 0660 (rw-rw----), reachable by
+# peer agents in the `agents` group via dtach -p.
+umask 0007
+
+case "$VERB" in
+  fix-socket)
+    # Reconcile dtach socket + dir ownership/perms so peer agents (in
+    # the `agents` group) can `dtach -p` for delivery and `socket_alive`
+    # probes. Runs as root via ExecStartPost. (#141)
+    #
+    # Why all four ops every start, not just chmod:
+    # - The dtach socket lands 0600 owned by the agent's uid (dtach
+    #   hardcodes mode regardless of umask).
+    # - Setgid on .dtach normally makes new entries inherit the dir's
+    #   group (which is `agents`, set by do_new). But if .dtach was
+    #   deleted and harness's `start` path re-mkdir'd it as
+    #   user=<handle> group=<handle>, the setgid inheritance silently
+    #   produces sockets owned <handle>:<handle> on every subsequent
+    #   start — peers in the `agents` group then can't connect, and
+    #   `agents list` reports the live agent as offline (#141).
+    # - chgrp the dir to recover from any drift, then chmod 2770 to
+    #   re-establish setgid + group-rwx, then chgrp/chmod the socket
+    #   itself for the current session.
+    chgrp agents "$SOCK_DIR" 2>/dev/null || true
+    chmod 2770  "$SOCK_DIR" 2>/dev/null || true
+    chgrp agents "$SOCK"     2>/dev/null || true
+    chmod 0660  "$SOCK"     2>/dev/null || true
+    exit 0
+    ;;
+  start)
+    # Idempotent: skip if a live session already exists.
+    if [ -S "$SOCK" ] && </dev/null dtach -p "$SOCK" >/dev/null 2>&1; then
+      echo "harness: $HANDLE already running on $SOCK" >&2
+      exit 0
+    fi
+    # Clean stale.
+    rm -f "$SOCK"
+    # Install the box's AskUserQuestion hooks into the agent's trusted user
+    # settings before launch (#181) — best-effort, never blocks start.
+    ensure_hooks
+    # dtach -n: create socket, run command detached, exit.
+    # -E: disable detach char so claude gets every keystroke.
+    # shellcheck disable=SC2046
+    exec dtach -n "$SOCK" -E $(build_argv)
+    ;;
+
+  attach)
+    # dtach -A: attach if live, else create-and-attach. -r winch triggers a
+    # redraw on attach (Claude TUI otherwise paints blank on cold attach).
+    ensure_hooks
+    # shellcheck disable=SC2046
+    exec dtach -A "$SOCK" -E -r winch $(build_argv)
+    ;;
+
+  flags)
+    build_argv
+    ;;
+
+  *)
+    echo "harness: unknown verb '$VERB' (want start|attach|flags)" >&2
+    exit 2
+    ;;
+esac

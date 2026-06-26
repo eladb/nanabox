@@ -1,0 +1,8 @@
+[Unit]
+Description=Fire /nightly-cycle on every running agent on this box
+Documentation=https://github.com/eladb/nanabox
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/libexec/nanabox/nightly-cycle

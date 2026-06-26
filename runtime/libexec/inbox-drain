@@ -1,0 +1,132 @@
+#!/bin/sh
+# inbox-drain — sidecar that delivers offline-queued messages into a
+# running agent's harness.
+#
+# Usage: inbox-drain <handle>
+#
+# Runs as the agent's uid. Polls the dtach socket until alive, then drains
+# every *.msg file in ~/.agents/inbox/ into the session via dtach -p,
+# moving each delivered file into ~/.agents/inbox/processed/. Then watches
+# the inbox for new files and delivers them on arrival.
+#
+# Live delivery (when the sender's claude is up) goes through dtach
+# directly via the `agents` CLI — no separate live socket, the dtach
+# socket itself is the live channel (perms: <handle>:agents 0660).
+
+set -eu
+
+HANDLE="${1:?usage: inbox-drain <handle>}"
+HOME_DIR="$(getent passwd "$HANDLE" | cut -d: -f6)"
+[ -n "$HOME_DIR" ] || { echo "inbox-drain: no home for $HANDLE" >&2; exit 1; }
+
+INBOX="$HOME_DIR/.agents/inbox"
+PROCESSED="$INBOX/processed"
+# Spool of in-flight (injected, not-yet-processed) messages a UI can surface
+# during the window before the agent's mid-turn run dequeues it and writes the
+# user turn to the transcript. Mirrors the live-send spool in `agents`.
+PENDING="$HOME_DIR/.agents/pending"
+SOCK="$HOME_DIR/.dtach/$HANDLE.sock"
+
+mkdir -p "$INBOX" "$PROCESSED" "$PENDING"
+chmod 0770 "$INBOX" "$PROCESSED" "$PENDING" 2>/dev/null || true
+
+# Wait for the harness to come up. Up to ~60s; then bail (next start tries again).
+i=0
+while [ "$i" -lt 60 ]; do
+  if [ -S "$SOCK" ] && </dev/null dtach -p "$SOCK" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+  i=$((i + 1))
+done
+
+if [ ! -S "$SOCK" ] || ! </dev/null dtach -p "$SOCK" >/dev/null 2>&1; then
+  echo "inbox-drain: harness for $HANDLE never came up; exiting" >&2
+  exit 1
+fi
+
+# spool_pending FROM MSG — record a just-delivered offline message into the
+# pending spool so a UI can show it during the in-flight window (before the
+# mid-turn agent dequeues it). Mirrors `agents`' spool_pending; best-effort.
+spool_pending() {
+  from="$1"; msg="$2"
+  [ -d "$PENDING" ] || return 0
+  ts=$(date -u +%s%3N 2>/dev/null) || ts=$(($(date -u +%s) * 1000))
+  rand="$$-${RANDOM:-0}"
+  tmp=$(mktemp "$PENDING/.spool.XXXXXX" 2>/dev/null) || return 0
+  esc=$(printf '%s' "$msg" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+        -e 's/\t/\\t/g' -e 's/\r/\\r/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+  if printf '{"id":"%s","from":"%s","ts":%s,"text":"%s"}' \
+       "$ts-$rand" "$from" "$ts" "$esc" >"$tmp" 2>/dev/null; then
+    chmod 0660 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$PENDING/$ts-$rand.json" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+# from_of FILE — extract the sender handle encoded in an inbox filename.
+# `<ts>-<from>.to.<handle>.msg` or legacy `<ts>-<from>.msg`. Echoes "" if it
+# can't parse (the spool entry just shows no sender then).
+from_of() {
+  b=$(basename "$1")
+  b=${b%.msg}
+  b=${b%.to.*}      # strip the .to.<handle> suffix when present
+  printf '%s' "${b#*-}"  # drop the leading <ts>-
+}
+
+inject() {
+  # $1 = message-file path. Use bracketed-paste so claude treats the body
+  # as one paste; then send Enter as a separate write with a small gap
+  # (matches the dtach paste→Enter race memory).
+  msg=$(cat "$1")
+  printf '\033[200~%s\033[201~' "$msg" | dtach -p "$SOCK"
+  sleep 0.15
+  printf '\r' | dtach -p "$SOCK"
+}
+
+deliver_one() {
+  f="$1"
+  [ -f "$f" ] || return 0
+  # Only deliver mail addressed to THIS handle (eladb/nanabox#189). The inbox
+  # dir is shared by same-uid peers, so a peer's drain also sees these files;
+  # filenames are `<ts>-<from>.to.<handle>.msg`. Leave a peer's mail in place
+  # for its own drain. Legacy `<ts>-<from>.msg` (no `.to.`) predates this and
+  # is delivered as-is (single-agent boxes are unambiguous; on a shared home a
+  # leftover legacy file is already-ambiguous and drains on the first pass).
+  case "$f" in
+    *.to."$HANDLE".msg) ;;   # addressed to me
+    *.to.*.msg)  return 0 ;; # addressed to a peer — not mine to drain
+    *.msg)       ;;          # legacy unaddressed — deliver (back-compat)
+    *)           return 0 ;; # not a message file
+  esac
+  if inject "$f"; then
+    spool_pending "$(from_of "$f")" "$(cat "$f")"
+    mv "$f" "$PROCESSED/"
+  else
+    echo "inbox-drain: failed to inject $f" >&2
+  fi
+}
+
+# Drain the backlog.
+for f in "$INBOX"/*.msg; do
+  [ -e "$f" ] || break
+  deliver_one "$f"
+done
+
+# Tail with inotify if available; else poll.
+if command -v inotifywait >/dev/null 2>&1; then
+  inotifywait -m -e close_write,moved_to --format '%w%f' "$INBOX" 2>/dev/null |
+    while IFS= read -r path; do
+      deliver_one "$path"
+    done
+else
+  # Polling fallback (1s tick). Cheap; only used in stripped-down test envs.
+  while :; do
+    sleep 1
+    for f in "$INBOX"/*.msg; do
+      [ -e "$f" ] || break
+      deliver_one "$f"
+    done
+  done
+fi

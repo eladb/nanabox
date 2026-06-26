@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically pull the nanabox system repo
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=nanabox-auto-update.service
+
+[Install]
+WantedBy=timers.target

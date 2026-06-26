@@ -1,0 +1,55 @@
+{
+	# No public domain / TLS — Caddy serves plain HTTP, bound to localhost.
+	# Agents reach the box over Claude Remote Control; to expose a port on the
+	# public internet an agent runs an ephemeral
+	#   cloudflared tunnel --url http://localhost:PORT
+	# quick tunnel (a throwaway *.trycloudflare.com link, no account/domain).
+	auto_https off
+}
+
+# Bind localhost only — nothing here is meant to face the public internet
+# directly. Per-agent published apps and the browser watch-along are reached
+# either locally or through an agent-initiated ephemeral cloudflared tunnel.
+127.0.0.1:80 {
+	root * /srv/webapp/public
+
+	# Browser watch-along: /browser* → the per-box Chromium's KasmVNC web UI
+	# (nanabox-chrome.service, 127.0.0.1:3000). The container serves the UI
+	# under the /browser/ subpath (SUBFOLDER) so assets and the websocket
+	# resolve correctly behind this route. reverse_proxy upgrades websockets
+	# automatically.
+	handle /browser* {
+		# The container only serves at /browser/ (with the trailing slash);
+		# bare /browser 404s upstream and KasmVNC emits no redirect. Send it
+		# to /browser/ ourselves so the bare URL works. redir is ordered
+		# before reverse_proxy, so the slash path falls through to the proxy.
+		@browser_root path /browser
+		redir @browser_root /browser/ permanent
+		reverse_proxy 127.0.0.1:3000
+	}
+
+	# Per-agent web apps (publish-web). Path convention /<handle>/* → the
+	# agent's own loopback service, which it runs as ITSELF (a
+	# systemctl --user service) bound to a unix socket at the deterministic
+	# path /run/nanabox/agents/<handle>.sock. Caddy reverse-proxies to that
+	# socket with the FULL path preserved. No port allocation, no registry:
+	# the socket path derives from the handle.
+	#
+	# A missing socket (no app, or not running) yields a 502, which is
+	# acceptable.
+	#
+	# The matcher captures the first path segment as the handle and EXCLUDES
+	# the reserved /browser route so it can never shadow it. `agents` reserves
+	# these same names as handles, so a real agent name can never collide with
+	# a route (bin/agents reserved_handle()).
+	@agentapp {
+		path_regexp agentapp ^/([a-z][a-z0-9-]{0,31})(/.*)?$
+		not path /browser /browser/*
+	}
+	handle @agentapp {
+		reverse_proxy unix//run/nanabox/agents/{re.agentapp.1}.sock
+	}
+
+	# Everything else: static files from /srv/webapp/public.
+	file_server
+}

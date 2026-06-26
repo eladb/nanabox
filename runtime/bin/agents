@@ -1,0 +1,1284 @@
+#!/bin/bash
+# agents — per-agent-unix-user CLI. Single binary that owns every
+# nanabox-side action: messaging, listing, lifecycle, recovery.
+#
+# Filesystem client only (no central daemon). Authorization is "you can
+# reach the socket / write the inbox / sudo," which the agents group +
+# unix perms + sudoers enforce in the kernel.
+#
+# Subcommands:
+#
+#   list, ls                              enumerate agents (getent group agents) + online
+#   whoami, me                            print the caller's handle
+#   ctx, context                          print your identity + shared-vs-per-handle file map
+#   send <to> [--file PATH|-] <msg…>      deliver via dtach if live, else inbox file
+#   broadcast [--all] [--file PATH|-] <msg…>
+#                                         send to every other agent (--all includes self)
+#   tail <handle>                         attach the agent's dtach session
+#   interrupt <handle>                    cancel the agent's in-flight turn
+#                                         (sends raw ESC to the dtach socket;
+#                                         idempotent if the agent is idle)
+#   clear [--file PATH|-|--message-file F] [msg…]
+#                                         send /clear to self, optional follow-up
+#   restart [name…]                       systemctl restart nanabox-agent@<n>
+#
+# Root-only lifecycle (escalates via sudo if you call from a non-root agent):
+#
+#   new <handle> [--repo URL] [--description TEXT] [--login]
+#                                         provision a new agent; with --login
+#                                         also drives the first-time Claude
+#                                         OAuth dance (see `login` below)
+#   add <git-url> [--handle NAME]         provision an agent from a repo URL;
+#                                         handle defaults to the repo basename
+#                                         (slugified); runs install.sh post-clone
+#   spawn <child> [root] [--sudo] [--message MSG]
+#                                         spawn a peer agent sharing the caller's
+#                                         unix user (same uid → shares files,
+#                                         repo, ~/.claude creds; no login). root
+#                                         = working dir under the caller's home
+#                                         (default: the home itself). --sudo
+#                                         grants the shared uid sudo; --message
+#                                         is delivered once the session is up.
+#   rm <handle> [--keep-home]             remove an agent
+#   shell-switch <handle> <claude|bash>   flip an agent's login shell
+#   login <handle> [--code CODE#STATE] [--timeout SECONDS]
+#                                         drive a fresh agent through Claude's
+#                                         /login OAuth flow: inject /login,
+#                                         print the URL to stdout, read
+#                                         code#state from stdin (or --code),
+#                                         verify credentials, then restart so
+#                                         claude.ai Remote Control is live.
+#                                         Exits 0 once both creds and the
+#                                         restart have landed.
+#
+#   help, -h, --help                      show this help
+#
+# Exit codes: 0 ok; 2 usage; 3 not authorized / EACCES; 4 target not found.
+
+set -euo pipefail
+
+PROG=$(basename "$0")
+
+usage() {
+  sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# ---- helpers -------------------------------------------------------------
+
+self_handle() {
+  if [ -n "${AGENT_NAME:-}" ]; then
+    printf '%s\n' "$AGENT_NAME"
+  else
+    id -un
+  fi
+}
+
+home_of()  { getent passwd "$1" | cut -d: -f6 ; }
+sock_of()  {
+  local home; home=$(home_of "$1") || return 1
+  [ -n "$home" ] || return 1
+  printf '%s/.dtach/%s.sock\n' "$home" "$1"
+}
+inbox_of() {
+  local home; home=$(home_of "$1") || return 1
+  [ -n "$home" ] || return 1
+  printf '%s/.agents/inbox\n' "$home"
+}
+
+socket_alive() {
+  [ -S "$1" ] || return 1
+  </dev/null dtach -p "$1" >/dev/null 2>&1
+}
+
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "$PROG: '$1' must run as root; retrying via sudo" >&2
+    exec sudo -E "$0" "$@"
+  fi
+}
+
+list_agents() {
+  local roster=""
+  if getent group agents >/dev/null; then
+    roster=$(getent group agents | cut -d: -f4 | tr ',' '\n')
+  fi
+  # Root is not an agent on a nanabox — see bootstrap.sh for the why.
+  printf '%s\n' "$roster" | awk 'NF' | sort -u
+}
+
+# peers_of HANDLE — other agents that SHARE this handle's $HOME (same-uid
+# `agents spawn` peers, eladb/nanabox#177/#183). These are exactly the agents
+# that share HANDLE's CLAUDE.md / memory / settings / git tree, so they're the
+# ones identity confusion happens between.
+peers_of() {
+  local me="$1" myhome; myhome=$(home_of "$me" 2>/dev/null) || return 0
+  [ -n "$myhome" ] || return 0
+  local h
+  while IFS= read -r h; do
+    [ -n "$h" ] && [ "$h" != "$me" ] || continue
+    [ "$(home_of "$h" 2>/dev/null)" = "$myhome" ] && printf '%s\n' "$h"
+  done < <(list_agents)
+  return 0  # the loop's last test may be falsy; don't leak that under set -e
+}
+
+inject() {
+  local sock="$1" msg="$2"
+  # Serialize injects to the SAME socket (eladb/nanabox#190). The multi-Return
+  # submit-retry below assumes "after the first Return lands, the rest are
+  # no-ops" — false if a CONCURRENT inject is mid-paste on the same composer: a
+  # trailing Return submits its half-pasted text as a fragment turn (the stray
+  # "are" during the nightly restart storm). broadcast/nightly/peer sends are
+  # separate processes, so we lock on a file in the group-writable runtime dir
+  # (every agent + root can create it there; the dtach socket dir isn't writable
+  # cross-uid). Best-effort: if we can't take the lock, proceed unserialized.
+  local _lockdir=/run/nanabox/agents _lf _um
+  _lf="$_lockdir/$(basename "$sock").inject.lock"
+  # Create the lock GROUP-WRITABLE so cross-owner locking works no matter who
+  # creates it first. /run/nanabox/agents is setgid `agents`, so the lock lands
+  # `*:agents`; umask 002 makes it 0664, letting any agents-group member (every
+  # agent AND root) reopen it for write. Created 0644 (the old default), a
+  # non-root agent can't lock a file root made first → #190's serialization is
+  # silently lost and a `Permission denied` leaks to stderr (eladb/nanabox#211).
+  # Use a brace-group `2>/dev/null` (NOT a trailing redirect on `exec`) so a
+  # failed-open message is actually suppressed — bash applies `9>` before a
+  # trailing `2>`, which is why the old form still leaked the error.
+  if [ -d "$_lockdir" ]; then
+    _um="$(umask)"; umask 002
+    if { exec 9>"$_lf"; } 2>/dev/null; then
+      # Heal a lock a pre-#211 root run left at 0644 (root can chmod; a non-root
+      # agent that hits such a stale file just proceeds unserialized, as before).
+      if [ "$(id -u)" = 0 ]; then chmod g+w "$_lf" 2>/dev/null || true; fi
+      flock -w 15 9 2>/dev/null || true
+    fi
+    umask "$_um"
+  fi
+  printf '\033[200~%s\033[201~' "$msg" | dtach -p "$sock" 2>/dev/null || { exec 9>&- 2>/dev/null || true; return 1; }
+  # Submit the pasted message. Claude Code may still be ingesting the bracketed
+  # paste when the Return arrives — most visibly for attachment turns, where it
+  # resolves and READS the referenced image files (multi-MB) before the composer
+  # settles — so a single, promptly-sent Return is dropped and the text sits
+  # unsubmitted (and the next send's paste then stacks on top of it). Send Return
+  # a few times with growing gaps so the submit still lands once Claude is ready;
+  # after the first one takes, the composer is empty and further Returns are
+  # harmless no-ops. This is the lowest-level delivery path for every send
+  # (Remote Control text/attachments, broadcast, nightly cycle), so reliability
+  # here is worth a second of latency.
+  local d
+  for d in 0.2 0.5 1.0; do
+    sleep "$d"
+    printf '\r' | dtach -p "$sock" 2>/dev/null || { exec 9>&- 2>/dev/null || true; return 1; }
+  done
+  exec 9>&- 2>/dev/null || true  # release the per-socket inject lock (#190)
+}
+
+# read_message_body — populate MSG_BODY from the leading args.
+# Forms:
+#   --file PATH    → read PATH
+#   --file -       → read stdin
+#   <words...>     → join positional args as the body (matches "$*")
+#
+# --file is mutually exclusive with positional message args. Empty body
+# is allowed here; the caller decides whether that's an error.
+# Returns 0 on success with MSG_BODY set; 2 on usage error.
+read_message_body() {
+  MSG_BODY=""
+  if [ "${1:-}" = "--file" ]; then
+    [ $# -ge 2 ] || { echo "$PROG: --file requires a path or '-'" >&2; return 2; }
+    local path="$2"; shift 2
+    [ $# -eq 0 ] || { echo "$PROG: --file cannot be combined with a positional message" >&2; return 2; }
+    if [ "$path" = "-" ]; then
+      MSG_BODY=$(cat)
+    else
+      [ -r "$path" ] || { echo "$PROG: --file: cannot read $path" >&2; return 2; }
+      MSG_BODY=$(cat -- "$path")
+    fi
+  elif [ $# -ge 1 ]; then
+    MSG_BODY="$*"
+  fi
+}
+
+# pending_dir HANDLE — the per-recipient spool of in-flight (injected but not
+# yet processed) messages. Lives beside the inbox so the same setgid/group
+# perms apply.
+pending_dir() {
+  local home; home=$(home_of "$1") || return 1
+  [ -n "$home" ] || return 1
+  printf '%s/.agents/pending\n' "$home"
+}
+
+# spool_pending FROM TO MSG — record a message we just delivered to TO into
+# TO's pending spool (~TO/.agents/pending/<ts>-<rand>.json). The spool tracks
+# messages during the window between "injected into the live session" and
+# "Claude dequeues it and writes the user turn to the transcript", so a UI that
+# reads the transcript can surface cross-agent / harness-queued / broadcast
+# messages that are in flight.
+#
+# Best-effort: any failure is a no-op — delivery already succeeded; the spool is
+# a display aid only.
+spool_pending() {
+  local from="$1" to="$2" msg="$3" dir ts rand tmp home parent esc
+  dir=$(pending_dir "$to" 2>/dev/null) || return 0
+  if [ ! -d "$dir" ]; then
+    # Mirror inbox_drop's self-heal: only root can synthesize under the
+    # recipient's uid; a non-root caller on a missing dir just skips.
+    [ "$(id -u)" -eq 0 ] || return 0
+    home=$(home_of "$to" 2>/dev/null) || return 0
+    [ -d "$home" ] || return 0
+    parent="$home/.agents"
+    sudo -u "$to" -H mkdir -p "$dir" 2>/dev/null || return 0
+    chgrp -R agents "$parent" 2>/dev/null || true
+    chmod 2770 "$parent" "$dir" 2>/dev/null || true
+  fi
+  ts=$(date -u +%s%3N 2>/dev/null) || ts=$(($(date -u +%s) * 1000))
+  rand="$$-${RANDOM:-0}"
+  tmp=$(mktemp "$dir/.spool.XXXXXX" 2>/dev/null) || return 0
+  # Hand-roll JSON (no jq dependency here). Escape backslash, double-quote, tab,
+  # CR and newline so the body is a valid JSON string on one line.
+  esc=$(printf '%s' "$msg" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+        -e 's/\t/\\t/g' -e 's/\r/\\r/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+  if printf '{"id":"%s","from":"%s","ts":%s,"text":"%s"}' \
+       "$ts-$rand" "$from" "$ts" "$esc" >"$tmp" 2>/dev/null; then
+    chmod 0660 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$dir/$ts-$rand.json" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+inbox_drop() {
+  local from="$1" to="$2" msg="$3" dest ts tmp parent home
+  dest=$(inbox_of "$to") || return 4
+  # Auto-create the inbox dir if missing. Some agents were provisioned before
+  # do_new seeded `.agents/inbox/`, and they were dropping pings on the floor
+  # because inbox_drop returned 4 here. Only root can synthesize the dir under
+  # the recipient's uid; a non-root caller (peer agent) on a missing-dir target
+  # falls back to the original return-4 since heuristically self-healing someone
+  # else's home is brittle. The lossy case in practice is a root-run delivery.
+  if [ ! -d "$dest" ]; then
+    if [ "$(id -u)" -ne 0 ]; then
+      return 4
+    fi
+    home=$(home_of "$to" 2>/dev/null) || return 4
+    [ -d "$home" ] || return 4
+    parent="$home/.agents"
+    # Match do_new: setgid + 0770 on .agents and inbox, group=agents so
+    # peer agents can drop messages.
+    sudo -u "$to" -H mkdir -p "$dest/processed" 2>/dev/null || return 3
+    chgrp -R agents "$parent" 2>/dev/null || true
+    chmod 2770 "$parent" "$dest" "$dest/processed" 2>/dev/null || true
+  fi
+  ts=$(date -u +%Y%m%dT%H%M%S)
+  tmp=$(mktemp "$dest/.from-$from.XXXXXX") || return 3
+  printf '%s' "$msg" >"$tmp"
+  # The setgid bit on the inbox dir makes the group inherit (agents), but
+  # the umask determines mode bits. Default umask is typically 022 → 0644,
+  # which means "rw-r--r--" — group can read. That's enough for the
+  # recipient (also in agents). Force 0660 to be explicit.
+  chmod 0660 "$tmp" 2>/dev/null || true
+  # Encode the RECIPIENT in the filename (eladb/nanabox#189). Same-uid `agents
+  # spawn` peers share one inbox dir (it's home-keyed), so without this the
+  # recipient is implied only by the dir and inbox-drain delivers a peer's
+  # message to whichever drain fires first. `.to.<handle>` lets each drain glob
+  # for only its own mail. Handles are [a-z0-9-] (no dots), so `.` is an
+  # unambiguous delimiter and `.to.<to>.msg` parses by glob alone.
+  mv "$tmp" "$dest/$ts-$from.to.$to.msg"
+}
+
+valid_handle() {
+  local h="$1"
+  case "$h" in
+    *[!a-z0-9-]*|-*|*-|"") return 1 ;;
+  esac
+  [ ${#h} -le 32 ]
+}
+
+reserved_handle() {
+  case "$1" in
+    root|agent|agents|caddy|nanabox|webapp|browser|cgi) return 0 ;;
+    # Reserved Caddy routes: a handle is served at /<handle>/*, so a name
+    # colliding with an existing route (the /browser watch-along, the static
+    # surfaces) would either be shadowed by that route or shadow it. Forbid
+    # them outright.
+    api|srv|public) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# seed_claude_json HANDLE HOME — pre-clear claude's two first-run gates in
+# ~/.claude.json so a fresh agent reaches /login + Remote Control without
+# stalling (eladb/nanabox#48):
+#   - top-level hasCompletedOnboarding (+ a default theme) → theme picker
+#   - projects[HOME].hasTrustDialogAccepted /
+#     hasCompletedProjectOnboarding   → "trust this folder?" prompt, which
+#     otherwise re-asks on every fresh start (the accepted flag only persists
+#     on graceful shutdown).
+# Merges into an existing file (jq * never clobbers unrelated keys); owned by
+# the agent, mode 0600.
+seed_claude_json() {
+  local handle="$1" home="$2" f="$home/.claude.json"
+  command -v jq >/dev/null 2>&1 || return 0
+  local existing='{}'
+  [ -f "$f" ] && existing=$(cat "$f")
+  printf '%s' "$existing" | jq \
+    --arg home "$home" \
+    '. * {
+       hasCompletedOnboarding: true,
+       theme: (.theme // "dark"),
+       projects: ((.projects // {}) * {
+         ($home): (((.projects // {})[$home] // {}) * {
+           hasTrustDialogAccepted: true,
+           hasCompletedProjectOnboarding: true
+         })
+       })
+     }' >"$f.tmp"
+  mv "$f.tmp" "$f"
+  chown "$handle:$handle" "$f"
+  chmod 0600 "$f"
+}
+
+# seed_claude_settings HANDLE HOME — pre-clear claude's first-run "Bypass
+# Permissions" warning dialog (eladb/nanabox#87, sibling of #48). The dialog
+# fires on first interactive launch under `--dangerously-skip-permissions`
+# and defaults its highlight to "No, exit" — a bare Enter quits the session.
+# Claude persists the accept by writing skipDangerousModePermissionPrompt=true
+# to userSettings (~/.claude/settings.json) — verified against the claude
+# 2.1.x bin: the dialog's "accept" handler calls
+#   p6("userSettings",{skipDangerousModePermissionPrompt:!0})
+# so seeding the same key/file short-circuits the prompt on first launch.
+# Merges into an existing file (jq * preserves unrelated keys); owned by the
+# agent, mode 0644 (matches what claude writes itself).
+seed_claude_settings() {
+  local handle="$1" home="$2" d="$home/.claude" f="$home/.claude/settings.json"
+  command -v jq >/dev/null 2>&1 || return 0
+  local existing='{}'
+  [ -f "$f" ] && existing=$(cat "$f")
+  printf '%s' "$existing" | jq \
+    '. * { skipDangerousModePermissionPrompt: true }' >"$f.tmp"
+  mv "$f.tmp" "$f"
+  chown "$handle:$handle" "$d" "$f"
+  chmod 0644 "$f"
+}
+
+# print_agent_gitignore — emit a sensible default .gitignore for an agent whose
+# unix $HOME *is* its git working tree. Without it, every home dotfile/dir
+# (.ssh keys, .claude creds, caches, the .agents message spool, .env secrets)
+# surfaces as untracked and is one `git add -A` away from being committed. Keeps
+# .claude/skills/ + .claude/icon.svg trackable (agents author those) by ignoring
+# specific .claude/* paths rather than the whole dir. Used by cmd_new.
+print_agent_gitignore() {
+  cat <<'GITIGNORE'
+# Your unix $HOME is this repo's working tree, so every home dotfile/dir shows
+# up as untracked. These ignores keep secrets, caches, and runtime state out of
+# git so you don't commit them by accident. Edit freely — it's a starting point.
+
+# --- secrets / credentials — never commit ---------------------------------
+.env
+.env.*
+!.env.example
+.ssh/
+.envstore
+*.pem
+*.key
+**/credentials.json
+
+# --- shell / login dotfiles -----------------------------------------------
+.bashrc
+.bash_logout
+.bash_history
+.profile
+.cloud-locale-test.skip
+.lesshst
+.python_history
+.wget-hsts
+.viminfo
+.sudo_as_admin_successful
+
+# --- tool + cache dirs (reinstallable, not source) ------------------------
+.cache/
+.config/
+.local/
+.npm/
+.agent-browser/
+.attachments/
+.expo/
+
+# --- Claude Code runtime state (.claude/skills/ + icon.svg stay trackable) -
+.claude.json
+.claude.json.bak-*
+.claude/.credentials.json
+.claude/.last-cleanup
+.claude/.last-update-result.json
+.claude/agent-memory/
+.claude/backups/
+.claude/cache/
+.claude/file-history/
+.claude/history.jsonl
+.claude/image-cache/
+.claude/paste-cache/
+.claude/plugins/
+.claude/projects/
+.claude/scheduled_tasks.lock
+.claude/sessions/
+.claude/settings.json
+.claude/settings.local.json
+.claude/shell-snapshots/
+.claude/statsig/
+.claude/tasks/
+.claude/todos/
+.claude/worktrees/
+
+# --- nanabox per-agent runtime state + cross-agent message spool ----------
+.nana/
+.agents/
+.dtach/
+
+# --- language build junk --------------------------------------------------
+__pycache__/
+*.pyc
+node_modules/
+GITIGNORE
+}
+
+# ---- messaging subcommands ----------------------------------------------
+
+cmd_list() {
+  local me; me=$(self_handle)
+  printf '%-24s %-8s %s\n' AGENT STATUS HOME
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    local home sock status
+    home=$(home_of "$h" 2>/dev/null || echo -)
+    sock=$(sock_of "$h" 2>/dev/null || echo /dev/null)
+    if socket_alive "$sock"; then status=online; else status=offline; fi
+    [ "$h" = "$me" ] && status="$status*"
+    printf '%-24s %-8s %s\n' "$h" "$status" "$home"
+  done < <(list_agents)
+}
+
+cmd_whoami() { self_handle ; }
+
+# cmd_ctx — print this agent's identity + the shared-vs-per-handle file map in
+# one shot (eladb/nanabox#183). The harness feeds this same output into the
+# session's system prompt (--append-system-prompt) so it's the single source of
+# truth for "who am I", grounding both interactive `agents ctx` and the agent's
+# context. Same-uid spawn peers share $HOME; without this an agent reads the
+# shared, first-person-voiced CLAUDE.md/memory as if it were itself.
+cmd_ctx() {
+  local me home cwd box peers
+  me=$(self_handle)
+  home=$(home_of "$me" 2>/dev/null || echo '?')
+  cwd=$(pwd 2>/dev/null || echo '?')
+  box=$(hostname 2>/dev/null || echo '?')
+  peers=$(peers_of "$me" | paste -sd', ' -)
+  printf 'You are agent "%s" on box "%s". cwd=%s\n' "$me" "$box" "$cwd"
+  if [ -n "$peers" ]; then
+    printf 'HOME=%s is SHARED with same-uid peer agent(s): %s\n' "$home" "$peers"
+    printf 'PER-HANDLE (yours alone): %s/.agents/%s/nightly-summary.md, your dtach socket %s/.dtach/%s.sock, and your Claude session (slug from cwd).\n' "$home" "$me" "$home" "$me"
+    printf 'SHARED with those peers and written from the box-owner perspective — when these say "you" they may mean a DIFFERENT agent, so do not assume their first person is you: %s/CLAUDE.md, the memory store + MEMORY.md, %s/.claude/settings.json, %s/.claude.json, and the git working tree (coordinate before committing). Run `agents whoami` / `agents ctx` any time you are unsure which agent you are.\n' "$home" "$home" "$home"
+  else
+    printf 'HOME=%s (you are the sole agent in this home — no shared-identity caveats).\n' "$home"
+  fi
+}
+
+cmd_send() {
+  [ $# -ge 2 ] || { echo "usage: $PROG send <handle> [--file PATH|-] <message...>" >&2; exit 2; }
+  local to="$1"; shift
+  read_message_body "$@" || exit $?
+  [ -n "$MSG_BODY" ] || { echo "$PROG send: empty message, refusing to deliver" >&2; exit 2; }
+  local msg="$MSG_BODY"
+  local from; from=$(self_handle)
+  if [ "$to" = "$from" ]; then
+    echo "$PROG send: refusing to send to yourself ($from) — a self-send injects into your own session and lands looking like a peer message, which breaks grounding (eladb/nanabox#183). Use '$PROG clear [msg]' to leave a note for your own next turn." >&2
+    exit 2
+  fi
+  id "$to" >/dev/null 2>&1 || { echo "$PROG send: no such agent '$to'" >&2; exit 4; }
+  local sock; sock=$(sock_of "$to")
+  if socket_alive "$sock"; then
+    if inject "$sock" "$msg"; then
+      # Record it in the recipient's pending spool so a UI can show it during
+      # the in-flight window (injected, but not yet dequeued + written to the
+      # transcript by a mid-turn agent). Best-effort.
+      spool_pending "$from" "$to" "$msg"
+      echo "delivered (live) -> $to"; return 0
+    fi
+    echo "$PROG send: live socket alive but inject failed; falling back to inbox" >&2
+  fi
+  if inbox_drop "$from" "$to" "$msg"; then
+    echo "queued (inbox) -> $to"; return 0
+  fi
+  echo "$PROG send: could not deliver to $to" >&2
+  exit 3
+}
+
+cmd_broadcast() {
+  local include_self=0
+  if [ "${1:-}" = "--all" ]; then include_self=1; shift; fi
+  read_message_body "$@" || exit $?
+  [ -n "$MSG_BODY" ] || { echo "usage: $PROG broadcast [--all] [--file PATH|-] <message...>" >&2; exit 2; }
+  local msg="$MSG_BODY" me; me=$(self_handle)
+  local any=0
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    if [ "$include_self" -eq 0 ] && [ "$h" = "$me" ]; then continue; fi
+    if "$0" send "$h" "$msg"; then any=1; fi
+  done < <(list_agents)
+  [ "$any" -eq 1 ] || { echo "$PROG broadcast: no recipients" >&2; exit 1; }
+}
+
+cmd_tail() {
+  [ $# -ge 1 ] || { echo "usage: $PROG tail <handle>" >&2; exit 2; }
+  local sock; sock=$(sock_of "$1") || { echo "$PROG tail: no such agent $1" >&2; exit 4; }
+  exec dtach -a "$sock" -E -r winch
+}
+
+# interrupt — cancel the agent's current in-flight turn, as if the operator
+# pressed ESC at claude's prompt. Idempotent: an already-idle agent eats the
+# ESC harmlessly. Needs only write access to the dtach socket (the agents
+# group has it), so this stays sudo-free.
+cmd_interrupt() {
+  [ $# -ge 1 ] || { echo "usage: $PROG interrupt <handle>" >&2; exit 2; }
+  local h="$1"
+  id "$h" >/dev/null 2>&1 || { echo "$PROG interrupt: no such agent '$h'" >&2; exit 4; }
+  local sock; sock=$(sock_of "$h") || { echo "$PROG interrupt: cannot resolve socket for $h" >&2; exit 4; }
+  socket_alive "$sock" || { echo "$PROG interrupt: $h has no live session" >&2; exit 3; }
+  # ESC (0x1b) — claude's documented cancel for an in-flight turn. Write
+  # the raw byte, no carriage return.
+  printf '\033' | dtach -p "$sock" 2>/dev/null \
+    || { echo "$PROG interrupt: could not write to $sock" >&2; exit 3; }
+}
+
+cmd_clear() {
+  # --message-file PATH and --file PATH (or -) are aliases.
+  local body=""
+  if [ "${1:-}" = "--message-file" ] || [ "${1:-}" = "--file" ]; then
+    [ $# -ge 2 ] || { echo "$PROG clear: $1 requires a path" >&2; exit 2; }
+    local flag="$1" path="$2"; shift 2
+    [ $# -eq 0 ] || { echo "$PROG clear: $flag cannot be combined with a positional follow-up message" >&2; exit 2; }
+    if [ "$path" = "-" ]; then
+      body=$(cat)
+    else
+      [ -r "$path" ] || { echo "$PROG clear: $flag: cannot read $path" >&2; exit 2; }
+      body=$(cat -- "$path")
+    fi
+  elif [ $# -gt 0 ]; then
+    body="$*"
+  fi
+  local me sock; me=$(self_handle); sock=$(sock_of "$me")
+  socket_alive "$sock" || { echo "$PROG clear: own harness not live" >&2; exit 3; }
+  inject "$sock" "/clear"
+  if [ -n "$body" ]; then sleep 8; inject "$sock" "$body"; fi
+}
+
+# kill_session HANDLE — terminate a single agent's live claude/dtach session,
+# scoped strictly to that handle. The unit is KillMode=process (intentional, so
+# a runtime upgrade's unit churn doesn't kill live sessions), so `systemctl
+# restart` alone leaves the dtach'd claude alive and the idempotent harness
+# `start` then no-ops. To actually cycle we must tear the session down here:
+# SIGTERM (let claude flush ~/.claude.json / save state), wait, SIGKILL
+# fallback, then drop the stale socket so the harness launches fresh.
+# Matches on the handle's own dtach socket path and `--remote-control <h>`
+# cmdline so we never touch another agent's processes.
+kill_session() {
+  local h="$1" sock pat
+  sock=$(sock_of "$h" 2>/dev/null || true)
+  # \<h\>.sock / --remote-control h — both anchor on the exact handle. The
+  # socket path also covers the dtach process; --remote-control covers claude.
+  pat="(--remote-control[[:space:]]+$h([[:space:]]|\$)|${sock//\//\\/})"
+  pkill -TERM -f "$pat" 2>/dev/null || true
+  local deadline=$((SECONDS + 3))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    pgrep -f "$pat" >/dev/null 2>&1 || break
+    sleep 0.5
+  done
+  pkill -KILL -f "$pat" 2>/dev/null || true
+  [ -n "$sock" ] && rm -f "$sock"
+}
+
+cmd_restart() {
+  if [ $# -eq 0 ]; then set -- "$(self_handle)"; fi
+  for h in "$@"; do
+    if [ "$(self_handle)" = "$h" ] || [ "$(id -u)" = "0" ]; then
+      kill_session "$h"
+      systemctl restart "nanabox-agent@$h.service"
+    else
+      # Escalate the whole restart (teardown + unit cycle) for non-self/root.
+      sudo -E "$0" restart "$h"
+    fi
+  done
+}
+
+# ---- lifecycle subcommands (root-only; auto-escalate via sudo) -----------
+
+cmd_new() {
+  if [ "$(id -u)" -ne 0 ]; then exec sudo -E "$0" new "$@"; fi
+  do_new "$@"
+}
+
+do_new() {
+  local handle="" repo="" description="" run_login=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)        repo="$2"; shift 2 ;;
+      --description) description="$2"; shift 2 ;;
+      --login)       run_login=1; shift ;;
+      -*)            echo "$PROG new: unknown flag $1" >&2; exit 2 ;;
+      *)
+        if [ -z "$handle" ]; then handle="$1"; shift
+        else echo "$PROG new: too many positional args" >&2; exit 2; fi
+        ;;
+    esac
+  done
+  [ -n "$handle" ] || { echo "$PROG new: handle required" >&2; exit 2; }
+  valid_handle "$handle" || { echo "$PROG new: bad handle '$handle' (a-z 0-9 -, max 32, no edge dashes)" >&2; exit 2; }
+  reserved_handle "$handle" && { echo "$PROG new: handle '$handle' is reserved" >&2; exit 2; }
+
+  getent group agents >/dev/null || groupadd -r agents
+
+  if id "$handle" >/dev/null 2>&1; then
+    echo "$PROG new: user $handle already exists; reapplying skeleton" >&2
+  else
+    # GECOS field uses colons internally — keep the --comment colon-free.
+    useradd \
+      --create-home \
+      --shell /usr/bin/agent-sh \
+      --user-group \
+      --groups agents \
+      --comment "Nanabox agent $handle" \
+      "$handle"
+  fi
+
+  local home; home=$(home_of "$handle")
+  [ -n "$home" ] || { echo "$PROG new: failed to resolve home for $handle" >&2; exit 1; }
+
+  chmod 0755 "$home"
+
+  # Repo bootstrap.
+  if [ ! -d "$home/.git" ]; then
+    if [ -n "$repo" ]; then
+      sudo -u "$handle" -H git -C "$home" clone --quiet "$repo" tmp-clone
+      (
+        cd "$home/tmp-clone"
+        shopt -s dotglob nullglob
+        mv ./* "$home/"
+      )
+      rmdir "$home/tmp-clone"
+    else
+      sudo -u "$handle" -H git -C "$home" init --quiet
+    fi
+  fi
+
+  # .gitignore — $HOME *is* the working tree, so without this the agent's shell
+  # history, ssh keys, .claude creds, caches, and the .agents spool all show up
+  # as untracked and are one `git add -A` from being committed. Fresh `git init`
+  # home: drop a tracked .gitignore the agent owns and can extend. Cloned repo:
+  # don't clobber its own .gitignore — append the home-noise rules to the local,
+  # untracked .git/info/exclude instead (idempotent via a marker line).
+  if [ -n "$repo" ]; then
+    local excl="$home/.git/info/exclude"
+    if [ -f "$excl" ] && ! grep -q 'nanabox-agent-home' "$excl" 2>/dev/null; then
+      { printf '\n# nanabox-agent-home — keep $HOME noise out of git (added by `agents new`)\n'
+        print_agent_gitignore
+      } | sudo -u "$handle" -H tee -a "$excl" >/dev/null
+    fi
+  elif [ ! -f "$home/.gitignore" ]; then
+    print_agent_gitignore >"$home/.gitignore"
+    chown "$handle:$handle" "$home/.gitignore"
+  fi
+
+  # CLAUDE.md scaffold — simple, no parameter-expansion landmines.
+  if [ ! -f "$home/CLAUDE.md" ]; then
+    {
+      printf '# %s\n\n' "$handle"
+      if [ -n "$description" ]; then
+        printf '%s\n' "$description"
+      else
+        printf 'Nanabox agent. Replace this scaffold with the agent purpose, scope, and persistent context.\n'
+      fi
+    } >"$home/CLAUDE.md"
+    chown "$handle:$handle" "$home/CLAUDE.md"
+  fi
+
+  # Create ~/.claude/ — claude's session state lives here and is fully the
+  # agent's. We pre-seed a couple of files into it to skip first-run dialogs
+  # (see seed_claude_json / seed_claude_settings — #48 and #87). System
+  # CLAUDE.md + skills come in via `claude --add-dir /usr/share/nanabox` set
+  # in runtime/libexec/harness.
+  sudo -u "$handle" -H mkdir -p "$home/.claude"
+
+  seed_claude_json "$handle" "$home"
+  seed_claude_settings "$handle" "$home"
+
+  # .agents/pending is the in-flight spool a UI can surface (cross-agent /
+  # harness-queued messages before the mid-turn agent processes them) — same
+  # perms shape as inbox.
+  sudo -u "$handle" -H mkdir -p "$home/.agents/inbox" "$home/.agents/inbox/processed" "$home/.agents/pending"
+  chgrp -R agents "$home/.agents"
+  # 2770: setgid + 0770. The setgid bit makes files dropped here by peer
+  # agents inherit the group `agents`, so the recipient (in the agents
+  # group) can read them regardless of the sender's primary group.
+  chmod 2770 "$home/.agents" "$home/.agents/inbox" "$home/.agents/inbox/processed" "$home/.agents/pending"
+
+  sudo -u "$handle" -H mkdir -p "$home/.dtach"
+  chgrp agents "$home/.dtach"
+  # setgid + 0770 so the harness's dtach socket lands group=agents,
+  # combined with umask 0007 in the harness for 0660 file perms.
+  chmod 2770 "$home/.dtach"
+
+  if command -v loginctl >/dev/null 2>&1; then
+    loginctl enable-linger "$handle" 2>/dev/null || true
+  fi
+
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+    systemctl enable --now "nanabox-agent@$handle.service"
+    systemctl enable --now "nanabox-inbox@$handle.service"
+  fi
+
+  echo "$PROG new: $handle provisioned at $home"
+
+  if [ "$run_login" -eq 1 ]; then
+    # Wait for the freshly enabled nanabox-agent@<handle> unit to come up
+    # and the harness to bind the dtach socket before driving /login.
+    local sock; sock=$(sock_of "$handle")
+    if wait_for_socket "$sock" 60; then
+      # Give claude a beat to reach the login prompt inside the session.
+      sleep 2
+      do_login "$handle"
+    else
+      echo "$PROG new: --login skipped, $handle's session did not come up within 60s" >&2
+      exit 1
+    fi
+  fi
+}
+
+# ---- spawn (peer agent sharing the caller's unix user) -------------------
+#
+# A spawned agent is a real handle in the `agents` group, but created with
+# `useradd -o -u <parent-uid>` so it SHARES the parent's uid — and thus the
+# parent's files, repo, and ~/.claude creds (no login). Because it's a real
+# passwd entry, the whole machinery (systemd unit, harness, agent discovery,
+# send/tail/interrupt) works unchanged; only the dtach socket + handle differ.
+# See eladb/nanabox#156.
+
+cmd_spawn() {
+  # Capture the caller (the parent) BEFORE escalating — sudo makes us root and
+  # would otherwise lose the parent identity. Pass it through as SPAWN_PARENT.
+  if [ "$(id -u)" -ne 0 ]; then
+    exec sudo -E SPAWN_PARENT="$(self_handle)" "$0" spawn "$@"
+  fi
+  do_spawn "$@"
+}
+
+do_spawn() {
+  local child="" root="" want_sudo=0 have_msg=0 msg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --sudo)       want_sudo=1; shift ;;
+      --message)    msg="$2"; have_msg=1; shift 2 ;;
+      --message=*)  msg="${1#--message=}"; have_msg=1; shift ;;
+      --parent)     SPAWN_PARENT="$2"; shift 2 ;;
+      -*)           echo "$PROG spawn: unknown flag $1" >&2; exit 2 ;;
+      *)
+        if [ -z "$child" ]; then child="$1"; shift
+        elif [ -z "$root" ]; then root="$1"; shift
+        else echo "$PROG spawn: too many positional args" >&2; exit 2; fi
+        ;;
+    esac
+  done
+
+  local parent="${SPAWN_PARENT:-$(id -un)}"
+  [ -n "$child" ] || { echo "$PROG spawn: child name required" >&2; exit 2; }
+  valid_handle "$child" || { echo "$PROG spawn: bad child handle '$child' (a-z 0-9 -, max 32, no edge dashes)" >&2; exit 2; }
+  reserved_handle "$child" && { echo "$PROG spawn: child handle '$child' is reserved" >&2; exit 2; }
+  id "$child" >/dev/null 2>&1 && { echo "$PROG spawn: '$child' already exists" >&2; exit 2; }
+
+  id "$parent" >/dev/null 2>&1 || { echo "$PROG spawn: parent '$parent' not found" >&2; exit 1; }
+  local puid phome
+  puid=$(id -u "$parent")
+  phome=$(home_of "$parent")
+  [ -n "$phome" ] && [ -d "$phome" ] || { echo "$PROG spawn: cannot resolve home for parent '$parent'" >&2; exit 1; }
+
+  # Resolve the working dir. Default = parent home; a custom root must stay
+  # under it (relative, no '..' escape).
+  local workdir
+  if [ -z "$root" ]; then
+    workdir="$phome"
+  else
+    case "$root" in
+      /*)    echo "$PROG spawn: root must be relative to the parent's home" >&2; exit 2 ;;
+      *..*)  echo "$PROG spawn: root must not escape the parent's home ('..')" >&2; exit 2 ;;
+    esac
+    workdir="$phome/${root#./}"
+  fi
+
+  getent group agents >/dev/null || groupadd -r agents
+
+  # Duplicate-uid user: distinct handle/login + own per-user group, but the
+  # parent's uid and HOME (no new home created — shares creds/repo/env).
+  useradd \
+    --non-unique --uid "$puid" \
+    --no-create-home --home-dir "$phome" \
+    --shell /usr/bin/agent-sh \
+    --user-group \
+    --groups agents \
+    --comment "Nanabox spawned agent $child (peer of $parent)" \
+    "$child"
+
+  # Ensure the working dir exists, owned by the shared uid.
+  if [ ! -d "$workdir" ]; then
+    mkdir -p "$workdir"
+    chown "$puid" "$workdir" 2>/dev/null || true
+  fi
+
+  # Custom root → WorkingDirectory drop-in (default home matches the unit
+  # template's WorkingDirectory=~, so no drop-in needed there).
+  if [ "$workdir" != "$phome" ]; then
+    local dropdir="/etc/systemd/system/nanabox-agent@$child.service.d"
+    mkdir -p "$dropdir"
+    printf '[Service]\nWorkingDirectory=%s\n' "$workdir" > "$dropdir/spawn.conf"
+  fi
+
+  # --sudo: grant by uid (#<uid>) so it matches regardless of which name
+  # getpwuid resolves the shared uid to. NOTE: same uid as the parent, so this
+  # grants the parent too — inherent to a same-user spawn.
+  if [ "$want_sudo" -eq 1 ]; then
+    local sudoers="/etc/sudoers.d/nanabox-spawn-$child"
+    printf '#%s ALL=(ALL) NOPASSWD:ALL\n' "$puid" > "$sudoers"
+    chmod 0440 "$sudoers"
+  fi
+
+  if command -v loginctl >/dev/null 2>&1; then
+    loginctl enable-linger "$child" 2>/dev/null || true
+  fi
+
+  # Only the agent unit — NOT nanabox-inbox@ (its HOME=/home/%i hardcode
+  # doesn't fit a shared-home spawn; live delivery uses the distinct socket).
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+    systemctl enable --now "nanabox-agent@$child.service"
+  fi
+
+  echo "$PROG spawn: $child spawned as $parent (uid $puid) in $workdir"
+
+  # Optional message once the session's socket is up. No login — shared creds.
+  if [ "$have_msg" -eq 1 ] && [ -n "$msg" ]; then
+    local sock; sock=$(sock_of "$child")
+    if wait_for_socket "$sock" 60; then
+      sleep 2
+      if inject "$sock" "$msg"; then
+        echo "$PROG spawn: delivered message to $child"
+      else
+        echo "$PROG spawn: message delivery to $child failed" >&2
+      fi
+    else
+      echo "$PROG spawn: $child session did not come up within 60s; message not delivered" >&2
+    fi
+  fi
+}
+
+# handle_from_url URL — derive a handle from a git URL: take the path basename,
+# strip a trailing .git, lowercase, replace any non-[a-z0-9-] with '-', collapse
+# runs of '-', strip leading/trailing '-'. Prints the result; caller validates.
+handle_from_url() {
+  local url="$1" base
+  base="${url%/}"
+  base="${base##*/}"
+  base="${base##*:}"
+  base="${base%.git}"
+  base=$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')
+  printf '%s\n' "$base"
+}
+
+cmd_add() {
+  if [ "$(id -u)" -ne 0 ]; then exec sudo -E "$0" add "$@"; fi
+  do_add "$@"
+}
+
+do_add() {
+  local url="" handle=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --handle) handle="$2"; shift 2 ;;
+      -*)       echo "$PROG add: unknown flag $1" >&2; exit 2 ;;
+      *)
+        if [ -z "$url" ]; then url="$1"; shift
+        else echo "$PROG add: too many positional args" >&2; exit 2; fi
+        ;;
+    esac
+  done
+  [ -n "$url" ] || { echo "usage: $PROG add <git-url> [--handle NAME]" >&2; exit 2; }
+
+  if [ -z "$handle" ]; then
+    handle=$(handle_from_url "$url")
+    [ -n "$handle" ] || { echo "$PROG add: could not derive handle from '$url'; pass --handle" >&2; exit 2; }
+  fi
+  valid_handle "$handle" || { echo "$PROG add: bad handle '$handle' (a-z 0-9 -, max 32, no edge dashes)" >&2; exit 2; }
+  reserved_handle "$handle" && { echo "$PROG add: handle '$handle' is reserved" >&2; exit 2; }
+
+  # Sentinel: only roll back if THIS invocation created the user. A re-run
+  # against an existing handle must not nuke pre-existing state.
+  local pre_existed=0
+  id "$handle" >/dev/null 2>&1 && pre_existed=1
+
+  do_new --repo "$url" "$handle"
+
+  local home; home=$(home_of "$handle")
+  [ -n "$home" ] || { echo "$PROG add: failed to resolve home for $handle" >&2; exit 1; }
+
+  if [ -e "$home/install.sh" ]; then
+    # Be tolerant: agents typically commit install.sh executable, but normalize.
+    chmod +x "$home/install.sh" 2>/dev/null || true
+    local log="/var/log/nanabox-install-$handle.log"
+    : >"$log"
+    chmod 0644 "$log" 2>/dev/null || true
+    local rc=0
+    sudo -u "$handle" -H bash "$home/install.sh" >>"$log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "$PROG add: install.sh failed (exit $rc); see $log" >&2
+      if [ "$pre_existed" -eq 0 ]; then
+        # Rollback — mirror cmd_rm's teardown shape.
+        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+          systemctl stop    "nanabox-agent@$handle.service" 2>/dev/null || true
+          systemctl stop    "nanabox-inbox@$handle.service" 2>/dev/null || true
+          systemctl disable "nanabox-agent@$handle.service" 2>/dev/null || true
+          systemctl disable "nanabox-inbox@$handle.service" 2>/dev/null || true
+        fi
+        pkill -KILL -u "$handle" 2>/dev/null || true
+        sleep 0.5
+        pkill -KILL -u "$handle" 2>/dev/null || true
+        if command -v loginctl >/dev/null 2>&1; then
+          loginctl disable-linger "$handle" 2>/dev/null || true
+        fi
+        userdel -r "$handle" 2>/dev/null || userdel "$handle" 2>/dev/null || true
+        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+          systemctl daemon-reload
+        fi
+      fi
+      exit "$rc"
+    fi
+  fi
+
+  echo "$PROG add: $handle provisioned from $url"
+}
+
+cmd_rm() {
+  if [ "$(id -u)" -ne 0 ]; then exec sudo -E "$0" rm "$@"; fi
+  do_rm "$@"
+}
+
+do_rm() {
+  local handle="" keep_home=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --keep-home) keep_home=1; shift ;;
+      -*)          echo "$PROG rm: unknown flag $1" >&2; exit 2 ;;
+      *)
+        if [ -z "$handle" ]; then handle="$1"; shift
+        else echo "$PROG rm: too many positional args" >&2; exit 2; fi
+        ;;
+    esac
+  done
+  [ -n "$handle" ] || { echo "$PROG rm: handle required" >&2; exit 2; }
+
+  case "$handle" in
+    root|agent|agents) echo "$PROG rm: refusing to remove '$handle'" >&2; exit 2 ;;
+  esac
+
+  if ! id "$handle" >/dev/null 2>&1; then
+    echo "$PROG rm: no such user $handle" >&2
+    exit 0
+  fi
+
+  # Spawned peers (agents spawn) share the parent's uid + HOME. Removing one
+  # must NEVER `userdel -r` (deletes the shared home) or `pkill -u` (kills the
+  # parent's processes — same uid). Detect a co-resident of this home and switch
+  # to a home-preserving, session-scoped teardown.
+  local shared=0 home_dir
+  home_dir=$(home_of "$handle" 2>/dev/null || true)
+  if [ -n "$home_dir" ] && \
+     [ -n "$(getent passwd | awk -F: -v h="$home_dir" -v me="$handle" '$6==h && $1!=me {print $1; exit}')" ]; then
+    shared=1
+    keep_home=1
+    echo "$PROG rm: '$handle' shares its home ($home_dir) — keeping home, killing only its session" >&2
+  fi
+
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl stop    "nanabox-agent@$handle.service" 2>/dev/null || true
+    systemctl stop    "nanabox-inbox@$handle.service" 2>/dev/null || true
+    systemctl disable "nanabox-agent@$handle.service" 2>/dev/null || true
+    systemctl disable "nanabox-inbox@$handle.service" 2>/dev/null || true
+  fi
+
+  if [ "$shared" -eq 1 ]; then
+    # Same uid as the parent: scope the kill to THIS handle's session only,
+    # never the parent's processes.
+    kill_session "$handle"
+  else
+    pkill -KILL -u "$handle" 2>/dev/null || true
+    sleep 0.5
+    pkill -KILL -u "$handle" 2>/dev/null || true
+  fi
+
+  if command -v loginctl >/dev/null 2>&1; then
+    loginctl disable-linger "$handle" 2>/dev/null || true
+  fi
+
+  # Clean spawn artifacts (no-ops for a normal agent).
+  rm -f "/etc/systemd/system/nanabox-agent@$handle.service.d/spawn.conf" 2>/dev/null || true
+  rmdir "/etc/systemd/system/nanabox-agent@$handle.service.d" 2>/dev/null || true
+  rm -f "/etc/sudoers.d/nanabox-spawn-$handle" 2>/dev/null || true
+
+  if [ "$shared" -eq 1 ]; then
+    # The uid is shared with the parent, which still has live processes, so a
+    # plain userdel refuses ("user in use"). -f forces the account removal;
+    # without -r the shared home is left untouched.
+    userdel -f "$handle"
+  elif [ "$keep_home" -eq 1 ]; then
+    userdel "$handle"
+  else
+    userdel -r "$handle" 2>/dev/null || userdel "$handle"
+  fi
+
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl reset-failed "nanabox-agent@$handle.service" "nanabox-inbox@$handle.service" 2>/dev/null || true
+    systemctl daemon-reload
+  fi
+
+  echo "$PROG rm: $handle removed"
+}
+
+# ---- login (first-time Claude OAuth) -------------------------------------
+#
+# Drives the same /login dance documented in skills/manage-agents (Path B),
+# but owned by the CLI so the operator doesn't have to script-scrape the
+# terminal themselves. Issue: eladb/nanabox#128.
+
+# dtach_send_raw SOCK STR — write raw bytes to a live dtach session, as if
+# typed at the terminal. Returns non-zero if the socket isn't writable.
+dtach_send_raw() {
+  local sock="$1" str="$2"
+  printf '%s' "$str" | dtach -p "$sock" 2>/dev/null
+}
+
+# capture_screen SOCK — print one redraw of an attached dtach session, ANSI
+# stripped, on stdout. Uses `script` to fake a wide PTY (cols=500) so any
+# long URL the agent prints survives the snapshot without wrapping. The
+# `timeout 2 dtach -a -r winch` exits after one screen refresh, which we
+# trigger by attaching with the `winch` redraw mode.
+capture_screen() {
+  local sock="$1" tmp
+  tmp=$(mktemp /tmp/agents-login-cap.XXXXXX)
+  # script -q to silence "Script started"; -c to run the inner pipeline;
+  # stty cols 1000 so even a long URL the agent prints stays on one line. The
+  # OAuth authorize URL is ~450 chars today; 1000 leaves ample margin for added
+  # scopes so the capture never wraps (a wrapped URL truncates to a dead link).
+  script -qc "stty cols 1000; timeout 2 dtach -a $sock -r winch" "$tmp" >/dev/null 2>&1 || true
+  # Strip ANSI escapes (CSI sequences) before returning.
+  sed -r 's/\x1B\[[0-9;?]*[ -\/]*[@-~]//g' "$tmp" 2>/dev/null
+  rm -f "$tmp"
+}
+
+# extract_oauth_url TEXT — print the last claude.ai/claude.com OAuth URL
+# appearing in TEXT, or nothing. Trailing ANSI artifacts can survive the
+# strip pass when ESC bytes get lost in transit (the captured pty buffer
+# isn't always clean), so we trim a tail like "[NNm" off the URL after the
+# regex match.
+extract_oauth_url() {
+  printf '%s' "$1" \
+    | grep -oE 'https://[^[:space:]]+' \
+    | grep -E 'claude\.(ai|com)' \
+    | tail -1 \
+    | sed -E 's/\[[0-9;]+m$//'
+}
+
+# wait_for_creds HANDLE TIMEOUT — block until ~HANDLE/.claude/.credentials.json
+# exists with a populated claudeAiOauth.accessToken AND
+# claudeAiOauth.subscriptionType. Returns 0 on success, 1 on timeout.
+wait_for_creds() {
+  local handle="$1" timeout="$2" home f
+  home=$(home_of "$handle") || return 1
+  f="$home/.claude/.credentials.json"
+  local deadline=$((SECONDS + timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ -f "$f" ]; then
+      local at st
+      at=$(sudo -u "$handle" jq -r '.claudeAiOauth.accessToken // empty' "$f" 2>/dev/null || true)
+      st=$(sudo -u "$handle" jq -r '.claudeAiOauth.subscriptionType // empty' "$f" 2>/dev/null || true)
+      if [ -n "$at" ] && [ -n "$st" ]; then return 0; fi
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# wait_for_socket SOCK TIMEOUT — block until the socket is writable.
+wait_for_socket() {
+  local sock="$1" timeout="$2"
+  local deadline=$((SECONDS + timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if socket_alive "$sock"; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+cmd_login() {
+  if [ "$(id -u)" -ne 0 ]; then exec sudo -E "$0" login "$@"; fi
+  do_login "$@"
+}
+
+do_login() {
+  local handle="" code="" timeout=120
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --code)    code="$2"; shift 2 ;;
+      --timeout) timeout="$2"; shift 2 ;;
+      -*)        echo "$PROG login: unknown flag $1" >&2; exit 2 ;;
+      *)
+        if [ -z "$handle" ]; then handle="$1"; shift
+        else echo "$PROG login: too many positional args" >&2; exit 2; fi
+        ;;
+    esac
+  done
+  [ -n "$handle" ] || { echo "usage: $PROG login <handle> [--code CODE#STATE] [--timeout SECONDS]" >&2; exit 2; }
+  id "$handle" >/dev/null 2>&1 || { echo "$PROG login: no such agent '$handle'" >&2; exit 4; }
+
+  local sock; sock=$(sock_of "$handle") || { echo "$PROG login: cannot resolve socket for $handle" >&2; exit 4; }
+
+  # Idempotency: if the agent is already logged in, just make sure RC is
+  # live (restart) and exit. Saves the operator from re-driving /login on
+  # a re-run.
+  if wait_for_creds "$handle" 0 2>/dev/null; then
+    echo "$PROG login: $handle already has credentials; restarting to ensure RC is live" >&2
+    kill_session "$handle"
+    systemctl restart "nanabox-agent@$handle.service"
+    wait_for_socket "$sock" 30 || { echo "$PROG login: socket did not come back after restart" >&2; exit 1; }
+    return 0
+  fi
+
+  wait_for_socket "$sock" 30 || { echo "$PROG login: $handle has no live session (no dtach socket); start the agent first" >&2; exit 3; }
+
+  # Fire /login. Two raw injections — "/login\r" (the slash command) and
+  # then "\r" (Enter, which picks the default highlighted option: 1.
+  # Claude subscription, what we want).
+  dtach_send_raw "$sock" $'/login\r' || { echo "$PROG login: could not write to $sock" >&2; exit 3; }
+  sleep 1
+  dtach_send_raw "$sock" $'\r' || { echo "$PROG login: could not write to $sock" >&2; exit 3; }
+
+  # Give claude time to render the OAuth URL screen, then capture ONCE.
+  # We deliberately don't poll — `capture_screen` opens a script pty and
+  # closes it 2s later, and on close dtach forwards a Ctrl-D byte to the
+  # session. One stray Ctrl-D claude tolerates with a "Press Ctrl-D again
+  # to exit" hint that fades; a second Ctrl-D shortly after KILLS the
+  # claude process. The earlier poll-15-times design hit the kill case
+  # immediately and the operator was left with no URL and a dead session.
+  # 9s is enough headroom for claude to finish rendering on a fresh box.
+  sleep 9
+  local url screen
+  screen=$(capture_screen "$sock")
+  url=$(extract_oauth_url "$screen")
+  [ -n "$url" ] || { echo "$PROG login: no OAuth URL on $handle's screen after /login" >&2; exit 1; }
+
+  # URL goes on stdout, one line, nothing else (matches the contract in #128).
+  printf '%s\n' "$url"
+
+  if [ -z "$code" ]; then
+    if [ -t 0 ]; then
+      printf '%s: paste the code#state from the OAuth callback and press Enter: ' "$PROG" >&2
+    fi
+    IFS= read -r code || { echo "$PROG login: no code on stdin" >&2; exit 2; }
+  fi
+  code=$(printf '%s' "$code" | tr -d '\r\n ')
+  [ -n "$code" ] || { echo "$PROG login: empty code#state" >&2; exit 2; }
+  case "$code" in
+    *'#'*) ;;
+    *) echo "$PROG login: code doesn't look like 'code#state' (missing '#')" >&2; exit 2 ;;
+  esac
+
+  # Paste the code via bracketed paste (so any '#' in the input goes through
+  # untouched and claude doesn't interpret a leading '/'). Append CR to
+  # submit the input.
+  printf '\033[200~%s\033[201~' "$code" | dtach -p "$sock" 2>/dev/null \
+    || { echo "$PROG login: could not deliver code to $sock" >&2; exit 3; }
+  sleep 0.3
+  dtach_send_raw "$sock" $'\r' || true
+
+  # Wait for claude to atomic-rename the .credentials.json into place with
+  # a full Max-tier grant (accessToken + subscriptionType).
+  if ! wait_for_creds "$handle" "$timeout"; then
+    echo "$PROG login: timed out waiting for credentials at ~$handle/.claude/.credentials.json" >&2
+    exit 1
+  fi
+
+  # Send the final Enter for the "Press Enter to continue" prompt that
+  # closes the login flow. Errors here are non-fatal — we're about to
+  # bounce the unit anyway.
+  sleep 0.5
+  dtach_send_raw "$sock" $'\r' 2>/dev/null || true
+
+  # Bounce the session so claude.ai Remote Control picks up the new grant
+  # and the agent appears as live in RC. Matches cmd_restart's teardown.
+  kill_session "$handle"
+  systemctl restart "nanabox-agent@$handle.service"
+
+  wait_for_socket "$sock" 30 || { echo "$PROG login: socket did not come back after restart" >&2; exit 1; }
+  # Re-verify creds survived the restart (sanity check — they should, the
+  # file is on disk; this just catches a really pathological race).
+  wait_for_creds "$handle" 5 || { echo "$PROG login: credentials missing after restart" >&2; exit 1; }
+
+  echo "$PROG login: $handle logged in and restarted; Remote Control should be live within a minute" >&2
+}
+
+cmd_shell_switch() {
+  if [ "$(id -u)" -ne 0 ]; then exec sudo -E "$0" shell-switch "$@"; fi
+  do_shell_switch "$@"
+}
+
+do_shell_switch() {
+  if [ $# -lt 2 ]; then
+    echo "usage: $PROG shell-switch <handle> <claude|bash|agent-sh>" >&2
+    exit 2
+  fi
+  local handle="$1" target="$2"
+
+  id "$handle" >/dev/null 2>&1 || { echo "$PROG shell-switch: no such user $handle" >&2; exit 2; }
+
+  id -nG "$handle" | tr ' ' '\n' | grep -qx agents \
+    || { echo "$PROG shell-switch: $handle is not in the agents group" >&2; exit 2; }
+
+  local new
+  case "$target" in
+    claude|agent-sh) new=/usr/bin/agent-sh ;;
+    bash)            new=/bin/bash ;;
+    *)               echo "$PROG shell-switch: bad target '$target'" >&2; exit 2 ;;
+  esac
+
+  [ -x "$new" ] || { echo "$PROG shell-switch: $new not executable" >&2; exit 1; }
+
+  chsh -s "$new" "$handle"
+  echo "$PROG shell-switch: $handle -> $new"
+}
+
+# ---- dispatch ------------------------------------------------------------
+
+[ $# -gt 0 ] || { usage; exit 2; }
+verb="$1"; shift
+case "$verb" in
+  list|ls)        cmd_list "$@" ;;
+  whoami|me)      cmd_whoami "$@" ;;
+  ctx|context)    cmd_ctx "$@" ;;
+  send)           cmd_send "$@" ;;
+  broadcast)      cmd_broadcast "$@" ;;
+  tail)           cmd_tail "$@" ;;
+  interrupt|stop) cmd_interrupt "$@" ;;
+  clear)          cmd_clear "$@" ;;
+  restart)        cmd_restart "$@" ;;
+  new)            cmd_new "$@" ;;
+  add)            cmd_add "$@" ;;
+  spawn)          cmd_spawn "$@" ;;
+  rm)             cmd_rm "$@" ;;
+  shell-switch)   cmd_shell_switch "$@" ;;
+  login)          cmd_login "$@" ;;
+  help|-h|--help) usage ;;
+  *)              echo "$PROG: unknown verb '$verb'" >&2; usage >&2; exit 2 ;;
+esac

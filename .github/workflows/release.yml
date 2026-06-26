@@ -1,0 +1,70 @@
+name: release
+
+# Build the runtime .deb and publish it as a GitHub Release, alongside a
+# latest.json manifest that `nana new` reads to install the runtime on a box.
+# Trigger by pushing a tag (v0.1.0) or running the workflow manually.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version, no leading v (e.g. 0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  NFPM_VERSION: '2.41.0'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = push ]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="${{ github.event.inputs.version }}"
+          fi
+          echo "version=$V"  >> "$GITHUB_OUTPUT"
+          echo "tag=v$V"     >> "$GITHUB_OUTPUT"
+          echo "deb=nanabox-runtime_${V}_all.deb" >> "$GITHUB_OUTPUT"
+
+      - name: Install nfpm
+        run: |
+          curl -sSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | sudo tar xz -C /usr/local/bin nfpm
+
+      - name: Build .deb
+        env:
+          NANABOX_DEB_VERSION: ${{ steps.v.outputs.version }}
+        run: ./scripts/build-runtime.sh
+
+      - name: Build manifest
+        run: |
+          DEB="${{ steps.v.outputs.deb }}"
+          SHA=$(sha256sum "$DEB" | cut -d' ' -f1)
+          cat > latest.json <<EOF
+          {
+            "version": "${{ steps.v.outputs.version }}",
+            "url": "https://github.com/${{ github.repository }}/releases/download/${{ steps.v.outputs.tag }}/$DEB",
+            "sha256": "$SHA"
+          }
+          EOF
+          cat latest.json
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.v.outputs.tag }}" \
+            --title "${{ steps.v.outputs.tag }}" \
+            --notes "nanabox runtime ${{ steps.v.outputs.tag }}" \
+            "${{ steps.v.outputs.deb }}" latest.json

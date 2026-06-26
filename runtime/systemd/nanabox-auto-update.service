@@ -1,0 +1,14 @@
+[Unit]
+Description=Poll the GitHub Releases channel for a new runtime artifact and atomically install it
+Documentation=https://github.com/eladb/nanabox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/sbin/nanabox-update
+# nanabox-update hands off to apt/dpkg, whose maintainer scripts run a
+# `systemctl daemon-reload` themselves; the `+-` line is kept as a
+# belt-and-braces no-op for boots where the script bailed early.
+ExecStartPost=+-/usr/bin/systemctl daemon-reload

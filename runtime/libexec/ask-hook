@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Claude Code PreToolUse/PostToolUse hook for the AskUserQuestion tool.
+
+Claude Code does NOT persist an AskUserQuestion tool_use to the session
+transcript while its interactive picker is open and blocking — the assistant
+message is only written once the question is answered. So an external reader of
+the transcript can't see a *live* question while the picker is up.
+
+This hook bridges that gap. On PreToolUse(AskUserQuestion) — which Claude Code
+runs to completion BEFORE the picker is shown — it writes the question to a
+sidecar an external reader can poll:
+
+    ~/.nana/pending-ask.json  = { id, session_id, ts, input }
+
+`input` is the raw tool_input (the `questions` array) verbatim, so the wire
+shape is whatever this claude version emits. On
+PostToolUse it deletes the sidecar (the real tool_use + tool_result are now in
+the transcript, so the answered card renders from there).
+
+Purely observational: reads stdin, never emits a hook decision, and always
+exits 0 — it can neither block nor alter the AskUserQuestion call. Any error is
+swallowed so a hook fault can never wedge the agent's turn.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import uuid
+
+TOOL = "AskUserQuestion"
+
+
+def sidecar_path() -> str:
+    # The hook runs as the agent, so $HOME is the agent's home. Mirror the
+    # ~/.nana convention already used for the agent icon (eladb/nanabox#155).
+    home = os.path.expanduser("~")
+    return os.path.join(home, ".nana", "pending-ask.json")
+
+
+def write_pending(data: dict) -> None:
+    path = sidecar_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    session_id = data.get("session_id") or ""
+    rec = {
+        # Stable per session so a reader keys the card consistently across
+        # polls while the question is live.
+        "id": "pending-ask:" + (session_id or uuid.uuid4().hex),
+        "session_id": session_id,
+        "ts": int(time.time()),
+        "input": data.get("tool_input") or {},
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rec, f)
+    os.replace(tmp, path)
+
+
+def clear_pending() -> None:
+    try:
+        os.remove(sidecar_path())
+    except FileNotFoundError:
+        pass
+
+
+def main() -> None:
+    try:
+        data = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    if data.get("tool_name") != TOOL:
+        return
+    event = data.get("hook_event_name")
+    if event == "PreToolUse":
+        write_pending(data)
+    elif event == "PostToolUse":
+        clear_pending()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        # Never let a hook fault disrupt the agent's turn.
+        pass
+    sys.exit(0)

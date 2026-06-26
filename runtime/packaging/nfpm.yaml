@@ -1,0 +1,150 @@
+# nfpm config for the nanabox per-box runtime Debian package.
+#
+# Built by scripts/build-runtime.sh on the build host. nfpm is a
+# build-time-only tool — a single Go binary; install it with
+#   go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+# or grab a release from https://github.com/goreleaser/nfpm/releases. It is
+# NOT a box dependency and must never appear in cloud-init or Depends:.
+#
+# nfpm does NOT env-expand the `src`/`dst`/`scripts` paths (only scalar
+# fields like `version`), so paths here are RELATIVE to the build cwd —
+# build-runtime.sh runs nfpm from the repo root. The one env var we use is
+# the version:
+#   NANABOX_DEB_VERSION   Debian version field (e.g. 0.1.1 — no leading 'v')
+#
+# Arch is `all`: everything shipped is arch-independent (shell scripts and
+# config).
+
+name: nanabox-runtime
+arch: all
+platform: linux
+version: ${NANABOX_DEB_VERSION}
+version_schema: none
+section: admin
+priority: optional
+maintainer: nanabox <noreply@example.com>
+description: |
+  Nanabox per-box runtime.
+  The agent CLI, login shim, harness/inbox libexec, systemd units, Caddy
+  config, shared skills and CLAUDE.md that every nanabox runs. The postinst
+  reconciles all on-box state on install AND upgrade, so dpkg owns the full
+  lifecycle.
+homepage: https://github.com/eladb/nanabox
+license: MIT
+
+# apt-installable prereqs the box needs. node / gh / claude / caddy /
+# cloudflared come from external apt repos or npm and are handled by
+# cloud-init + postinst, so they're deliberately NOT here.
+depends:
+  - curl
+  - ca-certificates
+  - jq
+  - dtach
+  - git
+  - python3
+  - python3-venv
+  - ripgrep
+  - fd-find
+  - inotify-tools
+  - sudo
+  - gnupg
+  - lsb-release
+
+contents:
+  # --- FHS-placed executables (copied out of the tree) --------------------
+  - src: runtime/bin/agents
+    dst: /usr/bin/agents
+    file_info:
+      mode: 0755
+  - src: runtime/bin/agent-sh
+    dst: /usr/bin/agent-sh
+    file_info:
+      mode: 0755
+  - src: runtime/bin/nanabox-update
+    dst: /usr/sbin/nanabox-update
+    file_info:
+      mode: 0755
+  - src: runtime/libexec/harness
+    dst: /usr/libexec/nanabox/harness
+    file_info:
+      mode: 0755
+  - src: runtime/libexec/inbox-drain
+    dst: /usr/libexec/nanabox/inbox-drain
+    file_info:
+      mode: 0755
+  - src: runtime/libexec/git-credential-nanabox
+    dst: /usr/libexec/nanabox/git-credential-nanabox
+    file_info:
+      mode: 0755
+  - src: runtime/libexec/nanabox-gh-token
+    dst: /usr/libexec/nanabox/nanabox-gh-token
+    file_info:
+      mode: 0755
+  - src: runtime/libexec/nightly-cycle
+    dst: /usr/libexec/nanabox/nightly-cycle
+    file_info:
+      mode: 0755
+  # Claude Code PreToolUse/PostToolUse hook for AskUserQuestion: writes the live
+  # question to ~/.nana/pending-ask.json. Wired via
+  # /usr/lib/nanabox/hooks.settings.json.
+  - src: runtime/libexec/ask-hook
+    dst: /usr/libexec/nanabox/ask-hook
+    file_info:
+      mode: 0755
+  # Claude Code SessionStart hook: records the agent's live session id to
+  # ~/.nana/session-<handle>.json on every start (incl. /clear, which forks a
+  # new id). Wired via hooks.settings.json.
+  - src: runtime/libexec/session-hook
+    dst: /usr/libexec/nanabox/session-hook
+    file_info:
+      mode: 0755
+
+  # --- systemd units (FHS: /usr/lib, not /etc) ----------------------------
+  - src: runtime/systemd/nanabox-agent@.service
+    dst: /usr/lib/systemd/system/nanabox-agent@.service
+  - src: runtime/systemd/nanabox-inbox@.service
+    dst: /usr/lib/systemd/system/nanabox-inbox@.service
+  - src: runtime/systemd/nanabox-auto-update.service
+    dst: /usr/lib/systemd/system/nanabox-auto-update.service
+  - src: runtime/systemd/nanabox-auto-update.timer
+    dst: /usr/lib/systemd/system/nanabox-auto-update.timer
+  - src: runtime/systemd/nanabox-nightly-cycle.service
+    dst: /usr/lib/systemd/system/nanabox-nightly-cycle.service
+  - src: runtime/systemd/nanabox-nightly-cycle.timer
+    dst: /usr/lib/systemd/system/nanabox-nightly-cycle.timer
+  - src: runtime/systemd/nanabox-chrome.service
+    dst: /usr/lib/systemd/system/nanabox-chrome.service
+
+  # --- tmpfiles.d (recreates /run/nanabox/agents on boot) ----------------
+  - src: runtime/tmpfiles/nanabox.conf
+    dst: /usr/lib/tmpfiles.d/nanabox.conf
+
+  # --- tree-resident assets the on-box symlinks point into ----------------
+  # caddy
+  - src: runtime/caddy/Caddyfile
+    dst: /usr/lib/nanabox/caddy/Caddyfile
+  - src: runtime/caddy/caddy.service.d.conf
+    dst: /usr/lib/nanabox/caddy/caddy.service.d.conf
+  # cloudflared unit (installed by postinst)
+  - src: runtime/cloudflared/cloudflared.service
+    dst: /usr/lib/nanabox/cloudflared/cloudflared.service
+  # shared skills tree (symlinked into /usr/share/nanabox/.claude/skills)
+  - src: runtime/skills
+    dst: /usr/lib/nanabox/skills
+  # box agent CLAUDE.md (symlinked into /usr/share/nanabox/CLAUDE.md)
+  - src: runtime/box/CLAUDE.md
+    dst: /usr/lib/nanabox/CLAUDE.md
+  # Claude Code hooks settings passed to every agent via the harness's
+  # --settings flag. Carries the AskUserQuestion PreToolUse/PostToolUse hooks;
+  # kept as a plain settings layer (CLI precedence), not enterprise
+  # managed-settings, so it's easy to reason about and override.
+  - src: runtime/packaging/hooks.settings.json
+    dst: /usr/lib/nanabox/hooks.settings.json
+  # per-box Chromium docker-compose (run by nanabox-chrome.service)
+  - src: runtime/chrome/docker-compose.yml
+    dst: /usr/lib/nanabox/chrome/docker-compose.yml
+
+scripts:
+  postinstall: runtime/packaging/postinst
+  preremove: runtime/packaging/prerm
+  postremove: runtime/packaging/postrm

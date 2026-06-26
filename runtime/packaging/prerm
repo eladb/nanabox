@@ -1,0 +1,29 @@
+#!/bin/bash
+# nanabox-runtime prerm — runs before files are removed.
+#
+# dpkg calls prerm with:
+#   remove          package is being removed
+#   upgrade <ver>   being replaced by a new version (don't tear anything down)
+#   ...
+#
+# On a real upgrade we want zero downtime, so we only stop services on an
+# actual `remove`. Boxes don't normally uninstall the runtime — this path is
+# mostly here so `dpkg --purge` is clean.
+
+set -e
+
+case "${1:-}" in
+  remove|deconfigure)
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+      systemctl stop nanabox-auto-update.timer    >/dev/null 2>&1 || true
+      systemctl disable nanabox-auto-update.timer  >/dev/null 2>&1 || true
+      systemctl stop nanabox-chrome.service        >/dev/null 2>&1 || true
+      systemctl disable nanabox-chrome.service     >/dev/null 2>&1 || true
+    fi
+    ;;
+  upgrade|failed-upgrade)
+    : # keep services running across an upgrade
+    ;;
+esac
+
+exit 0

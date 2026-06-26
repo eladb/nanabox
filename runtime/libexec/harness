@@ -278,7 +278,18 @@ build_argv() {
         rm -f "$_idf.tmp" 2>/dev/null || true
       fi
     fi
-    set -- "$@" --remote-control "$HANDLE"
+    # Remote Control session name is always <agent>@<box>, so a session in the
+    # Claude app is unambiguous across boxes. The box's primary agent (whose
+    # handle is the box name) is shown as "root" → root@<box>.
+    _box=$(cat /etc/nanabox/handle 2>/dev/null || true)
+    if [ -z "$_box" ]; then
+      _rc="$HANDLE"
+    elif [ "$HANDLE" = "$_box" ]; then
+      _rc="root@$_box"
+    else
+      _rc="$HANDLE@$_box"
+    fi
+    set -- "$@" --remote-control "$_rc"
     if [ -n "$SESSION_ID" ]; then
       if [ "$SESSION_EXISTS" = 1 ]; then
         set -- "$@" --resume "$SESSION_ID"

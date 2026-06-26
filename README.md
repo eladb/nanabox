@@ -16,16 +16,16 @@ Signing in the root agent to Claude:
   Open: https://claude.com/cai/oauth/authorize?…
   Paste code#state: ****************
 
-mybox is live — a Remote Control session named 'mybox' appears in any Claude app
+mybox is live — a Remote Control session named 'root@mybox' appears in any Claude app
 on this subscription.
 ```
 
-Open the Claude app and there's a session named **`mybox`** — that session *is*
+Open the Claude app and there's a session named **`root@mybox`** — that session *is*
 the box, and it's the box admin. From inside it you spin up and coordinate more
 agents, each with its own Linux user:
 
 ```
-agents new researcher        # new agent → its own user → its own RC session
+agents new researcher        # new agent → its own user → session researcher@mybox
 agents send researcher "…"   # message between agents
 ```
 
@@ -106,7 +106,11 @@ through. Here's the exact contract, so it can be driven by hand or by an agent:
    halves are matched; a mismatch means the wrong URL/code pair.
 4. `nana` submits it, waits for the credentials to land on the box, restarts the
    agent so Remote Control registers, and finishes. A Remote-Control session
-   named after the box then appears in any Claude app on that subscription.
+   `root@<box>` then appears in any Claude app on that subscription.
+
+Every Claude session is named `<agent>@<box>`, so sessions stay unambiguous
+across boxes in the Claude app — the box's primary agent shows as `root@<box>`,
+and each agent you add shows as `<handle>@<box>`.
 
 The URL and code are short-lived — complete the round-trip promptly.
 

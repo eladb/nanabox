@@ -258,7 +258,7 @@ URL_RE = re.compile(r"https://\S*claude\.(?:com|ai)/\S+")
 def create_agent(ip, name, login=True):
     """Stand up the box-named root agent and (optionally) sign it in.
 
-    `agents new <name>` makes a unix user + RC session named <name> (so the box
+    `agents new <name>` makes a unix user; its RC session shows as root@<name> (so the box
     shows up in the Claude app as "<name>"). The root agent is the box admin, so
     we grant it passwordless sudo. With login=True we then drive the Claude
     sign-in; login=False defers it (used by the unattended smoke test)."""
@@ -385,7 +385,7 @@ def cmd_new(args):
         print(f"\n{name} provisioned (not signed in). Sign in later with:")
         print(f"  nana ssh {name} agents login {name}")
         return
-    print(f"\n{name} is live — a Remote Control session named '{name}' will appear")
+    print(f"\n{name} is live — a Remote Control session named 'root@{name}' will appear")
     print("in any Claude app on this subscription. It's the box admin (passwordless")
     print("sudo); talk to it there and create more agents with `agents new <handle>`.")
     print(f"  ssh: ssh -i {SSH_KEY} root@{ip}")

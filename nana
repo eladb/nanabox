@@ -386,8 +386,8 @@ def cmd_new(args):
         print(f"  nana ssh {name} agents login {name}")
         return
     print(f"\n{name} is live — a Remote Control session named 'root@{name}' will appear")
-    print("in any Claude app on this subscription. It's the box admin (passwordless")
-    print("sudo); talk to it there and create more agents with `agents new <handle>`.")
+    print("in any Claude app on this subscription. Open it and say \"onboard me\" for a")
+    print("guided tour, or just start working — it's the box admin (passwordless sudo).")
     print(f"  ssh: ssh -i {SSH_KEY} root@{ip}")
 
 def cmd_list(args):

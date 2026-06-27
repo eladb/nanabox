@@ -8,6 +8,18 @@ Claude subscription. From then on you reach it from any Claude app — phone, de
 web — over Remote Control. No domain, no dashboard, nothing to host; you own the box
 and the bill.
 
+## Set it up with an AI agent
+
+New here? Paste this into Claude (or any AI agent) — it'll read the rest of this
+README and walk you through the whole setup:
+
+```text
+Read https://raw.githubusercontent.com/eladb/nanabox/main/README.md and help me set up a
+nanabox. Guide me through: getting a Hetzner API token, installing the `nana` CLI, and
+running `nana new <name>` — including the one-time Claude sign-in (show me the OAuth URL,
+then take the code#state I paste back). Ask me for anything you need as you go.
+```
+
 ## Why run one
 
 - **Always on.** Agents keep working while your laptop is closed — long builds,

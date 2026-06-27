@@ -267,6 +267,12 @@ def create_agent(ip, name, login=True):
     grant_sudo(ip, name)
     if login:
         login_agent(ip, name)
+        # Greet the user: nudge the freshly-signed-in root agent to start the
+        # guided onboarding (the `onboard` runtime skill), so opening the Remote
+        # Control session lands them mid-setup instead of a blank prompt.
+        # Best-effort — a failure here must not fail the provision.
+        ssh(ip, f"agents send {name} 'onboard me: give me the guided first-run "
+                "setup and a tour of this box'", stdout=subprocess.DEVNULL)
 
 def grant_sudo(ip, name):
     """Make the root agent the box admin: passwordless sudo, plus a note in its
@@ -386,8 +392,8 @@ def cmd_new(args):
         print(f"  nana ssh {name} agents login {name}")
         return
     print(f"\n{name} is live — a Remote Control session named 'root@{name}' will appear")
-    print("in any Claude app on this subscription. Open it and say \"onboard me\" for a")
-    print("guided tour, or just start working — it's the box admin (passwordless sudo).")
+    print("in any Claude app on this subscription. Open it: the box admin has already")
+    print("started a guided setup. (It's the box admin — passwordless sudo.)")
     print(f"  ssh: ssh -i {SSH_KEY} root@{ip}")
 
 def cmd_list(args):

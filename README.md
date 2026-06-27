@@ -8,7 +8,7 @@ Claude subscription. From then on you reach it from any Claude app — phone, de
 web — over Remote Control. No domain, no dashboard, nothing to host; you own the box
 and the bill.
 
-## Agent Quick Start
+## Agent Quickstart
 
 New here? Paste this into Claude (or any AI agent) — it reads the rest of this README
 and sets up your box with you:

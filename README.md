@@ -1,10 +1,41 @@
 # nanabox
 
-Spin up a personal **Claude-agent box** on your own cloud account with one
-command. You bring a cloud API token; `nana` provisions a VM, installs the agent
-runtime, and signs the box's root agent into your Claude subscription. From then
-on you talk to it **from any Claude app** logged into that subscription, over
-Remote Control. No domain, no dashboard, nothing to host.
+**Your own always-on, multi-agent Claude box — on your cloud, reachable from any Claude app.**
+
+One command turns a fresh cloud VM into a personal Claude Code environment: `nana`
+provisions the server, installs the agent runtime, and signs the box into *your*
+Claude subscription. From then on you reach it from any Claude app — phone, desktop,
+web — over Remote Control. No domain, no dashboard, nothing to host; you own the box
+and the bill.
+
+## Why run one
+
+- **Always on.** Agents keep working while your laptop is closed — long builds,
+  scheduled jobs, overnight tasks.
+- **Reach it from anywhere.** Every Claude app on your subscription sees the box's
+  sessions; start a task on your phone, pick it up at your desk.
+- **A team of agents, not one chat.** Run many agents, each isolated as its own Linux
+  user, that can talk to each other.
+- **Your cloud, your control.** It runs in your own Hetzner project and you have root —
+  no third-party SaaS in the middle.
+
+## What's built in
+
+Every box ships the full runtime, ready to go — no setup:
+
+- **Multi-agent, isolated** — `agents new <handle>` adds an agent with its own Linux
+  user and Remote Control session (`<handle>@<box>`); the root agent is the box admin
+  with passwordless `sudo`.
+- **Inter-agent messaging** — `agents send` / broadcast so agents coordinate.
+- **Headless browser** — a long-lived Chromium with CDP (drive it with `agent-browser`),
+  plus a live watch-along you can open in your own browser.
+- **One-command public URLs** — expose any agent's web app, API, or webhook on a
+  throwaway `*.trycloudflare.com` link via an ephemeral tunnel (no account, no domain).
+- **Nightly consolidation** — an optional routine that compresses each day's work into
+  durable memory.
+- **Self-updating** — boxes pull new runtime releases automatically.
+
+## Quickstart
 
 ```
 $ nana new mybox

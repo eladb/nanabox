@@ -4,3 +4,16 @@ nana_ed25519*
 .env
 *.bundle
 __pycache__/
+.claude.json
+.claude/.credentials.json
+.claude/history.jsonl
+.claude/cache/
+.claude/file-history/
+.claude/backups/
+.claude/image-cache/
+.claude/todos/
+.claude/statsig/
+.claude/shell-snapshots/
+.claude/.last-cleanup
+.env.*
+!.env.example
